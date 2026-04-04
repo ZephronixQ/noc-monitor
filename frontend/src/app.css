@@ -1,0 +1,11 @@
+@import "tailwindcss";
+
+/* Настраиваем поддержку темной темы */
+@custom-variant dark (&:where(.dark, .dark *));
+
+body {
+  @apply bg-slate-100 text-slate-900 transition-colors duration-300;
+}
+.dark body {
+  @apply bg-slate-900 text-slate-100;
+}
