@@ -36,7 +36,8 @@ def fetch_all_onu(host):
         for pon_port, onus in ports.items():
             port_onus = []
             for onu_id, state in onus:
-                desc = get_description(conn, pon_port, onu_id) if state != "working" else "—"
+                # ИЗМЕНЕНИЕ ЗДЕСЬ: Парсим договор ТОЛЬКО если статус не 'working' и не 'DyingGasp'
+                desc = get_description(conn, pon_port, onu_id) if state not in ["working", "DyingGasp"] else "—"
                 port_onus.append({"id": f"{pon_port}:{onu_id}", "contract": desc, "state": state})
             frontend_ports.append({"name": pon_port, "onus": port_onus})
 

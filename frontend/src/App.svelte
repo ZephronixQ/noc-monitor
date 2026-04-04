@@ -1,319 +1,377 @@
 <script>
-  import { onMount, onDestroy } from 'svelte';
+  import { onMount } from 'svelte';
   import { slide, fade } from 'svelte/transition';
 
-  // ─── Настройки подключения к локальному бэкенду ───
-  const BACKEND_URL = "http://localhost:8000";
-  const WS_URL = "ws://localhost:8000/ws";
+  let host = "localhost"; 
+  onMount(() => { host = window.location.hostname; });
 
-  let isDark = false;
+  $: BACKEND_URL = `http://${host}:8000`;
+  $: WS_URL = `ws://${host}:8000/ws`;
+
+  let activeTab = 'dash'; 
   let activeOltIndex = 0;
-  let searchQuery = '';
+  let activeFolderIndex = 0; // Индекс для папок коммутаторов
+  
+  // Независимые поисковые запросы
+  let searchQuery = ''; // Для OLT
+  let switchSearchQuery = ''; // Для Коммутаторов
+  
   let globalLosFilter = false;
-  
-  let activePort = null; 
-  let portPage = 0;
-  const ONU_PER_PAGE = 50;
-  
-  let toasts = []; 
-  let soundEnabled = true;
+  let activePort = null;
+  let subFilter = 'all'; // all, online, los, dying, offline
 
-  // Данные с сервера
+  // Пагинация для OLT
+  let currentPage = 1;
+  const itemsPerPage = 16;
+
   let data = [];
   let nextUpdateTs = 0;
   let timeToNextUpdate = "00:00";
   let isUpdating = true;
-  let ws;
-  let timerInterval;
 
-  function playAlert() {
-    if (!soundEnabled) return;
-    try {
-      const ctx = new (window.AudioContext || window.webkitAudioContext)();
-      const gainNode = ctx.createGain();
-      gainNode.connect(ctx.destination);
-      gainNode.gain.setValueAtTime(1, ctx.currentTime);
-      const osc1 = ctx.createOscillator();
-      osc1.type = 'sine'; osc1.frequency.setValueAtTime(587.33, ctx.currentTime); 
-      osc1.connect(gainNode); osc1.start(ctx.currentTime); osc1.stop(ctx.currentTime + 0.15);
-      const osc2 = ctx.createOscillator();
-      osc2.type = 'sine'; osc2.frequency.setValueAtTime(783.99, ctx.currentTime + 0.1); 
-      osc2.connect(gainNode); osc2.start(ctx.currentTime + 0.1); osc2.stop(ctx.currentTime + 0.3);
-      gainNode.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.3);
-    } catch(e) {}
-  }
+  // --- ДАННЫЕ OLT ---
+  $: olts = data.filter(d => !d.isSwitch);
+  $: currentOlt = olts[activeOltIndex] || { ports: [] };
 
-  $: currentDevice = data[activeOltIndex] || { ports: [] };
-  $: filteredPorts = currentDevice.ports?.filter(port => {
-    const hasLos = port.onus.some(o => o.state === 'LOS');
+  // Фильтрация портов OLT
+  $: filteredPorts = currentOlt.ports?.filter(port => {
+    const hasLos = port.onus.some(o => ['LOS', 'Down'].includes(o.state));
     if (globalLosFilter && !hasLos) return false;
-    if (searchQuery) {
-      const q = searchQuery.toLowerCase();
-      return port.name.toLowerCase().includes(q) || port.onus.some(o => String(o.contract).includes(q) || o.id.toLowerCase().includes(q));
-    }
-    return true;
+    
+    if (!searchQuery) return true;
+    const q = searchQuery.toLowerCase();
+    return port.name.toLowerCase().includes(q) || 
+           port.onus.some(o => (o.contract || '').toLowerCase().includes(q));
   }) || [];
+
+  $: paginatedPorts = filteredPorts.slice((currentPage - 1) * itemsPerPage, currentPage * itemsPerPage);
+  $: totalPages = Math.ceil(filteredPorts.length / itemsPerPage);
+
+
+  // --- ДАННЫЕ КОММУТАТОРОВ (С ПАПКАМИ) ---
+  $: switchDataNode = data.find(d => d.isSwitch) || { ports: [] };
+  $: switchFolders = switchDataNode.ports || [];
   
-  $: paginatedPorts = filteredPorts.slice(portPage * 16, (portPage + 1) * 16);
-  $: allOnus = currentDevice.ports?.flatMap(p => p.onus) || [];
-  $: mTotal = allOnus.length;
-  $: mOnline = allOnus.filter(o => o.state === 'working').length;
-  $: mLos = allOnus.filter(o => o.state === 'LOS').length;
-  $: mDying = allOnus.filter(o => o.state === 'DyingGasp').length;
+  // Плоский список всех коммутаторов
+  $: allSwitchesFlat = switchFolders.flatMap(folder => folder.onus || []);
+  
+  // Текущая активная папка
+  $: currentSwitchFolder = switchFolders[activeFolderIndex] || { onus: [] };
 
-  function toggleTheme() {
-    isDark = !isDark;
-    if (isDark) document.documentElement.classList.add('dark');
-    else document.documentElement.classList.remove('dark');
-  }
+  // Если есть текст в поиске - ищем по ВСЕМ папкам плоским списком. Если нет - показываем выбранную папку.
+  $: displayedSwitches = switchSearchQuery 
+    ? allSwitchesFlat.filter(sw => sw.id.toLowerCase().includes(switchSearchQuery.toLowerCase()) || (sw.contract || '').toLowerCase().includes(switchSearchQuery.toLowerCase()))
+    : currentSwitchFolder.onus || [];
 
-  function addToast(msg, type = 'error') {
-    const id = Date.now();
-    toasts = [...toasts, { id, msg, type }];
-    if (type === 'error') playAlert();
-    setTimeout(() => { toasts = toasts.filter(t => t.id !== id); }, 5000);
-  }
 
-  function exportCSV(port) {
-    const headers = "ID,Contract/VLAN,State\n";
-    const rows = port.onus.map(o => `${o.id},${o.contract},${o.state}`).join("\n");
-    const blob = new Blob([headers + rows], { type: 'text/csv;charset=utf-8;' });
-    const link = document.createElement("a");
-    link.href = URL.createObjectURL(blob);
-    link.download = `export_port_${port.name.replace(/\//g, '-')}.csv`;
-    link.click();
-    addToast(`CSV выгружен: ${port.name}`, 'success');
-  }
+  // --- СТАТИСТИКА (ОБЗОР) ---
+  $: totalStats = {
+    onus: olts.reduce((acc, olt) => acc + olt.ports.flatMap(p => p.onus).length, 0),
+    online: olts.reduce((acc, olt) => acc + olt.ports.flatMap(p => p.onus).filter(o => o.state === 'working').length, 0),
+    los: olts.reduce((acc, olt) => acc + olt.ports.flatMap(p => p.onus).filter(o => ['LOS', 'Down'].includes(o.state)).length, 0),
+    olts: olts.length,
+    switches: allSwitchesFlat.length,
+    swUp: allSwitchesFlat.filter(sw => sw.state === 'working' || sw.state === 'Host is alive').length
+  };
 
-  function togglePort(portName) {
-    if (activePort && activePort.name === portName) {
-      activePort = null;
-    } else {
-      activePort = { name: portName, filter: globalLosFilter ? 'LOS' : 'all', page: 0 };
-    }
-  }
+
+  // --- ФУНКЦИИ ---
+
+  const setTab = (tab) => { 
+    activeTab = tab; 
+    activePort = null; 
+    currentPage = 1; 
+  };
+  
+  const exportPortCsv = (port) => {
+    const headers = "ID,Contract,State\n";
+    const rows = port.onus.map(o => `${o.id},${o.contract || '—'},${o.state}`).join("\n");
+    const blob = new Blob([headers + rows], { type: 'text/csv' });
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `port_${port.name.replace(/\//g, '_')}.csv`;
+    a.click();
+  };
+
+  const exportJson = () => {
+    const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(data, null, 2));
+    const downloadAnchorNode = document.createElement('a');
+    downloadAnchorNode.setAttribute("href", dataStr);
+    downloadAnchorNode.setAttribute("download", "noc_export.json");
+    document.body.appendChild(downloadAnchorNode);
+    downloadAnchorNode.click();
+    downloadAnchorNode.remove();
+  };
+
+  const getStatusColor = (state) => {
+    if (state === 'working' || state === 'Host is alive') return 'text-emerald-500';
+    if (state === 'DyingGasp') return 'text-orange-500';
+    return 'text-red-500';
+  };
+
+  const getDotColor = (state) => {
+    if (state === 'working' || state === 'Host is alive') return 'bg-emerald-500';
+    if (state === 'DyingGasp') return 'bg-orange-500';
+    return 'bg-red-500';
+  };
 
   function updateTimer() {
     if (!nextUpdateTs) return;
-    const now = Math.floor(Date.now() / 1000);
-    const diff = nextUpdateTs - now;
-    if (diff <= 0) {
-      timeToNextUpdate = "Опрос...";
-      isUpdating = true;
-    } else {
-      const m = Math.floor(diff / 60).toString().padStart(2, '0');
-      const s = (diff % 60).toString().padStart(2, '0');
-      timeToNextUpdate = `${m}:${s}`;
-    }
+    const diff = nextUpdateTs - Math.floor(Date.now() / 1000);
+    timeToNextUpdate = diff <= 0 ? "00:00" : `${Math.floor(diff/60)}:${(diff%60).toString().padStart(2,'0')}`;
   }
 
   onMount(async () => {
-    // 1. Грузим данные по REST при заходе
     try {
       const res = await fetch(`${BACKEND_URL}/api/data`);
       const json = await res.json();
-      data = json.data;
-      nextUpdateTs = json.next_update;
-      isUpdating = json.is_updating;
-    } catch (e) {
-      addToast("Не удалось подключиться к FastAPI", "error");
-    }
+      data = json.data; nextUpdateTs = json.next_update; isUpdating = json.is_updating;
+    } catch(e) {}
 
-    // 2. Подключаем WebSocket для лайв-апдейтов
-    ws = new WebSocket(WS_URL);
-    ws.onmessage = (event) => {
-      const msg = JSON.parse(event.data);
+    const ws = new WebSocket(WS_URL);
+    ws.onmessage = (e) => {
+      const msg = JSON.parse(e.data);
       if (msg.type === "update") {
-        data = msg.data;
-        nextUpdateTs = msg.next_update;
-        isUpdating = msg.is_updating;
-        addToast("Данные успешно обновлены", "success");
-      } else if (msg.type === "status") {
-        isUpdating = msg.is_updating;
+        data = msg.data; nextUpdateTs = msg.next_update; isUpdating = msg.is_updating;
       }
     };
-    ws.onerror = () => addToast("Ошибка WebSocket соединения", "error");
-
-    // 3. Запускаем таймер
-    timerInterval = setInterval(updateTimer, 1000);
-  });
-
-  onDestroy(() => {
-    if (ws) ws.close();
-    clearInterval(timerInterval);
+    setInterval(updateTimer, 1000);
   });
 </script>
 
-<div class="fixed bottom-4 right-4 z-50 flex flex-col gap-2 pointer-events-none">
-  {#each toasts as toast (toast.id)}
-    <div transition:fade class="px-4 py-3 rounded-lg shadow-lg flex items-center gap-3 text-sm font-medium text-white {toast.type === 'error' ? 'bg-red-500' : 'bg-emerald-500'}">
-      {toast.msg}
+<div class="min-h-screen bg-slate-50 text-slate-900 font-sans flex flex-col">
+  <header class="bg-[#1e293b] text-white h-14 flex items-center justify-between px-6 sticky top-0 z-50 shadow-md">
+    <div class="flex items-center gap-8">
+      <div class="flex items-center gap-2">
+        <div class="w-8 h-8 bg-indigo-500 rounded flex items-center justify-center font-bold">N</div>
+        <span class="font-bold tracking-tight text-lg italic">NOC VISION</span>
+      </div>
+      
+      <nav class="flex gap-1 bg-slate-800 p-1 rounded-lg">
+        <button on:click={() => setTab('dash')} class="px-4 py-1 rounded text-[11px] font-bold transition-all {activeTab === 'dash' ? 'bg-indigo-500 shadow' : 'text-slate-400 hover:text-white'}">ОБЗОР</button>
+        <button on:click={() => setTab('olt')} class="px-4 py-1 rounded text-[11px] font-bold transition-all {activeTab === 'olt' ? 'bg-indigo-500 shadow' : 'text-slate-400 hover:text-white'}">GPON</button>
+        <button on:click={() => setTab('sw')} class="px-4 py-1 rounded text-[11px] font-bold transition-all {activeTab === 'sw' ? 'bg-indigo-500 shadow' : 'text-slate-400 hover:text-white'}">КОММУТАТОРЫ</button>
+      </nav>
     </div>
-  {/each}
+
+    <div class="flex items-center gap-4">
+      <button on:click={exportJson} class="text-[10px] bg-slate-700 hover:bg-slate-600 px-3 py-1 rounded font-bold transition-colors">JSON EXPORT</button>
+      <div class="font-mono text-[11px] text-slate-400">СЛЕД. ОПРОС: <span class="text-indigo-400">{timeToNextUpdate}</span></div>
+    </div>
+  </header>
+
+  <main class="p-6 flex-1 overflow-hidden flex flex-col">
+    <!-- ВКЛАДКА: ОБЗОР -->
+    {#if activeTab === 'dash'}
+      <div class="grid grid-cols-3 gap-6" in:fade>
+        <div class="bg-white p-8 rounded-3xl border border-slate-200 shadow-sm">
+          <span class="text-xs font-bold text-slate-400 uppercase tracking-widest">Клиенты (ONU)</span>
+          <div class="text-5xl font-black mt-2 text-slate-800">{totalStats.onus}</div>
+          <div class="mt-4 h-2 bg-slate-100 rounded-full overflow-hidden">
+            <div class="bg-indigo-500 h-full" style="width: {(totalStats.online/totalStats.onus)*100}%"></div>
+          </div>
+          <div class="mt-2 text-xs font-bold text-emerald-500">{((totalStats.online/totalStats.onus)*100).toFixed(1)}% Up</div>
+        </div>
+        <div class="bg-white p-8 rounded-3xl border border-slate-200 shadow-sm">
+          <span class="text-xs font-bold text-slate-400 uppercase tracking-widest">Коммутаторы</span>
+          <div class="text-5xl font-black mt-2 text-slate-800">{totalStats.swUp}/{totalStats.switches}</div>
+          <div class="mt-4 flex gap-1">
+             {#each Array(totalStats.switches) as _, i}
+               <div class="h-2 flex-1 rounded-full {i < totalStats.swUp ? 'bg-emerald-400' : 'bg-red-400'}"></div>
+             {/each}
+          </div>
+          <div class="mt-2 text-xs font-bold text-red-500">{totalStats.switches - totalStats.swUp} Down</div>
+        </div>
+        <div class="bg-white p-8 rounded-3xl border border-slate-200 shadow-sm">
+          <span class="text-xs font-bold text-slate-400 uppercase tracking-widest">Активные OLT</span>
+          <div class="text-5xl font-black mt-2 text-slate-800">{totalStats.olts}</div>
+          <p class="text-xs text-slate-400 mt-4 font-bold">Все системы мониторинга стабильны</p>
+        </div>
+      </div>
+
+    <!-- ВКЛАДКА: GPON (OLT) -->
+    {:else if activeTab === 'olt'}
+      <div class="flex gap-6 h-full overflow-hidden" in:fade>
+        <div class="w-64 flex flex-col gap-2 overflow-y-auto pr-2">
+          <h3 class="text-[10px] font-black text-slate-400 uppercase mb-2 px-2">Агрегация (OLT)</h3>
+          {#each olts as olt, i}
+            <!-- Считаем Онлайн / Всего для текущего OLT -->
+            {@const allOnus = olt.ports.flatMap(p => p.onus)}
+            {@const totalCount = allOnus.length}
+            {@const onlineCount = allOnus.filter(o => o.state === 'working').length}
+            
+            <button on:click={() => {activeOltIndex = i; currentPage = 1;}}
+              class="p-4 rounded-2xl border text-left transition-all {activeOltIndex === i ? 'bg-white border-indigo-500 shadow-md ring-1 ring-indigo-500' : 'bg-white/50 border-slate-200 hover:bg-white'}">
+              <div class="font-bold text-sm text-slate-700">{olt.ip}</div>
+              <div class="flex justify-between mt-1 items-center">
+                <!-- Выводим соотношение как на втором скрине -->
+                <span class="text-[10px] font-bold text-slate-400">{onlineCount} / {totalCount} В СЕТИ</span>
+                
+                <span class="text-[9px] font-black px-1.5 py-0.5 rounded {allOnus.some(o => ['LOS', 'Down'].includes(o.state)) ? 'bg-red-100 text-red-600' : 'bg-emerald-100 text-emerald-600'}">
+                   {allOnus.some(o => ['LOS', 'Down'].includes(o.state)) ? 'АВАРИЯ' : 'НОРМА'}
+                </span>
+              </div>
+            </button>
+          {/each}
+        </div>
+
+        <div class="flex-1 flex flex-col gap-4">
+          <div class="flex gap-2">
+            <input type="text" bind:value={searchQuery} placeholder="Поиск по интерфейсу или договору на {currentOlt.ip}..." 
+              class="flex-1 bg-white border border-slate-200 rounded-2xl px-6 py-3 shadow-sm outline-none focus:ring-2 ring-indigo-500/20 transition-all" />
+            <button on:click={() => {globalLosFilter = !globalLosFilter; currentPage = 1;}} 
+              class="px-6 rounded-2xl font-bold text-sm transition-all {globalLosFilter ? 'bg-red-500 text-white shadow-lg' : 'bg-white text-slate-600 border border-slate-200 hover:bg-slate-50'}">
+              LOS
+            </button>
+          </div>
+
+          <div class="flex-1 overflow-y-auto space-y-2 pr-2">
+            {#each paginatedPorts as port}
+              {@const pOnus = port.onus}
+              {@const losCount = pOnus.filter(o => ['LOS', 'Down'].includes(o.state)).length}
+              
+              <div class="bg-white border border-slate-200 rounded-2xl shadow-sm overflow-hidden">
+                <div class="flex items-center justify-between pr-4 hover:bg-slate-50 transition-colors">
+                  <button class="flex-1 flex items-center gap-6 p-4 text-left"
+                    on:click={() => { 
+                      if(activePort === port.name) { 
+                        activePort = null; 
+                      } else { 
+                        activePort = port.name; 
+                        subFilter = globalLosFilter ? 'los' : 'all'; 
+                      } 
+                    }}>
+                    <span class="font-black text-slate-700 w-16">{port.name}</span>
+                    <div class="w-48 h-1.5 bg-slate-100 rounded-full overflow-hidden">
+                      <div class="bg-indigo-500 h-full" style="width: {((pOnus.length - losCount)/pOnus.length)*100}%"></div>
+                    </div>
+                    <div class="text-[11px] font-bold text-slate-400">
+                      <span class={losCount > 0 ? 'text-red-500' : ''}>{losCount} ПРОБЛЕМ</span> / {pOnus.length}
+                    </div>
+                  </button>
+                  <button on:click|stopPropagation={() => exportPortCsv(port)} class="text-[10px] bg-slate-100 hover:bg-slate-200 px-3 py-1.5 rounded font-bold text-slate-500 transition-colors">CSV EXPORT</button>
+                </div>
+
+                {#if activePort === port.name}
+                  <div class="p-6 bg-slate-50 border-t border-slate-100" transition:slide>
+                    <div class="flex gap-4 mb-4">
+                      {#each [
+                        {id: 'all', label: 'Все', count: pOnus.length},
+                        {id: 'online', label: 'Online', count: pOnus.filter(o => o.state === 'working').length},
+                        {id: 'los', label: 'LOS/Down', count: losCount},
+                        {id: 'dying', label: 'DyingGasp', count: pOnus.filter(o => o.state === 'DyingGasp').length},
+                        {id: 'offline', label: 'Offline', count: pOnus.filter(o => o.state === 'Offline').length}
+                      ] as filter}
+                        <button on:click={() => subFilter = filter.id}
+                          class="text-[10px] font-black uppercase tracking-widest pb-1 border-b-2 transition-all 
+                          {subFilter === filter.id ? 'border-indigo-500 text-indigo-600' : 'border-transparent text-slate-400 hover:text-slate-600'}">
+                          {filter.label} ({filter.count})
+                        </button>
+                      {/each}
+                    </div>
+                    <div class="grid grid-cols-5 gap-3">
+                      {#each pOnus.filter(o => {
+                        if (subFilter === 'online') return o.state === 'working';
+                        if (subFilter === 'los') return ['LOS', 'Down'].includes(o.state);
+                        if (subFilter === 'dying') return o.state === 'DyingGasp';
+                        if (subFilter === 'offline') return o.state === 'Offline';
+                        return true;
+                      }) as onu}
+                        <div class="bg-white p-3 rounded-xl border border-slate-200 shadow-sm">
+                          <div class="flex justify-between items-start">
+                            <span class="text-[10px] font-bold text-slate-400">{onu.id.split(':').pop()}</span>
+                            <div class="w-2 h-2 rounded-full {getDotColor(onu.state)}"></div>
+                          </div>
+                          <div class="text-[11px] font-black mt-1 text-slate-800 truncate" title={onu.contract}>{onu.contract || '—'}</div>
+                          <div class="text-[9px] font-bold uppercase mt-1 {getStatusColor(onu.state)}">{onu.state}</div>
+                        </div>
+                      {/each}
+                    </div>
+                  </div>
+                {/if}
+              </div>
+            {/each}
+          </div>
+          <div class="flex justify-center items-center gap-4 py-2">
+            <button disabled={currentPage === 1} on:click={() => currentPage--} class="w-10 h-10 rounded-xl border border-slate-200 bg-white flex items-center justify-center disabled:opacity-30">←</button>
+            <span class="text-xs font-bold text-slate-500">СТРАНИЦА {currentPage} ИЗ {totalPages || 1}</span>
+            <button disabled={currentPage >= totalPages} on:click={() => currentPage++} class="w-10 h-10 rounded-xl border border-slate-200 bg-white flex items-center justify-center disabled:opacity-30">→</button>
+          </div>
+        </div>
+      </div>
+      
+    <!-- ВКЛАДКА: КОММУТАТОРЫ -->
+    {:else if activeTab === 'sw'}
+      <div class="flex gap-6 h-full overflow-hidden" in:fade>
+        
+        <!-- ЛЕВАЯ ПАНЕЛЬ ПАПОК -->
+        {#if !switchSearchQuery}
+          <div class="w-64 flex flex-col gap-2 overflow-y-auto pr-2" transition:slide={{ axis: 'x' }}>
+            <h3 class="text-[10px] font-black text-slate-400 uppercase mb-2 px-2">Папки / Локации</h3>
+            {#each switchFolders as folder, i}
+              {@const downs = folder.onus.filter(s => s.state !== 'working' && s.state !== 'Host is alive').length}
+              <button on:click={() => {activeFolderIndex = i;}}
+                class="p-4 rounded-2xl border text-left transition-all {activeFolderIndex === i ? 'bg-white border-indigo-500 shadow-md ring-1 ring-indigo-500' : 'bg-white/50 border-slate-200 hover:bg-white'}">
+                <div class="font-bold text-sm text-slate-700 truncate" title={folder.name}>{folder.name}</div>
+                <div class="flex justify-between mt-1 items-center">
+                  <span class="text-[10px] font-bold text-slate-400">{folder.onus.length} УЗЛОВ</span>
+                  {#if downs > 0}
+                    <span class="text-[9px] font-black px-1.5 py-0.5 rounded bg-red-100 text-red-600">{downs} DOWN</span>
+                  {:else}
+                    <span class="text-[9px] font-black px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-600">НОРМА</span>
+                  {/if}
+                </div>
+              </button>
+            {/each}
+            {#if switchFolders.length === 0}
+               <div class="text-xs text-slate-400 p-2 text-center">Папки не найдены</div>
+            {/if}
+          </div>
+        {/if}
+
+        <div class="flex-1 flex flex-col gap-4 overflow-hidden">
+          <!-- ПОИСК ПО КОММУТАТОРАМ -->
+          <div class="flex gap-2">
+            <input type="text" bind:value={switchSearchQuery} placeholder="Поиск по IP или адресу (ищет по ВСЕМ папкам)..." 
+              class="flex-1 bg-white border border-slate-200 rounded-2xl px-6 py-3 shadow-sm outline-none focus:ring-2 ring-indigo-500/20 transition-all" />
+          </div>
+
+          <!-- СЕТКА КОММУТАТОРОВ -->
+          <div class="grid grid-cols-4 gap-4 overflow-y-auto pr-2 pb-4 content-start">
+            {#each displayedSwitches as sw}
+              <div class="bg-white p-5 rounded-3xl border shadow-sm transition-all flex flex-col justify-between {sw.state === 'working' || sw.state === 'Host is alive' ? 'border-slate-200 hover:border-indigo-300' : 'border-red-200 bg-red-50 hover:border-red-400'}">
+                <div>
+                  <div class="flex justify-between items-start mb-2">
+                    <div class="font-mono font-bold text-slate-800 text-sm truncate" title={sw.id}>{sw.id}</div>
+                    <div class="w-2 h-2 mt-1.5 rounded-full {getDotColor(sw.state)}"></div>
+                  </div>
+                  <div class="text-[11px] font-bold text-slate-400 uppercase truncate" title={sw.contract}>{sw.contract || '—'}</div>
+                </div>
+                
+                <div class="mt-3 flex justify-between items-end gap-2">
+                  <div class="text-[10px] font-black {getStatusColor(sw.state)} uppercase">{sw.state}</div>
+                  <div class="text-[9px] font-bold text-slate-300 uppercase truncate text-right max-w-[50%]" title="Папка">
+                    {switchFolders.find(f => f.onus.includes(sw))?.name || ''}
+                  </div>
+                </div>
+              </div>
+            {/each}
+            
+            {#if displayedSwitches.length === 0}
+              <div class="col-span-4 text-center py-10 text-slate-400 font-bold text-sm">
+                Ничего не найдено
+              </div>
+            {/if}
+          </div>
+        </div>
+      </div>
+    {/if}
+  </main>
 </div>
 
-<header class="sticky top-0 z-40 bg-white/80 dark:bg-slate-900/80 backdrop-blur-md border-b border-slate-200 dark:border-slate-800 px-6 py-3 flex justify-between items-center shadow-sm">
-  <div class="flex items-center gap-3">
-    <div class="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center text-white font-bold">Z</div>
-    <h1 class="text-lg font-bold tracking-tight text-slate-900 dark:text-white">NOC Dashboard</h1>
-  </div>
-  <div class="flex items-center gap-6">
-    <div class="flex items-center gap-2 text-sm font-mono font-medium px-3 py-1.5 rounded-lg border {isUpdating ? 'bg-blue-50 border-blue-200 text-blue-600 dark:bg-blue-900/30 dark:border-blue-800 dark:text-blue-400 animate-pulse' : 'bg-slate-50 border-slate-200 text-slate-600 dark:bg-slate-800 dark:border-slate-700 dark:text-slate-400'}">
-      <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
-      {isUpdating ? "Идёт опрос оборудования..." : `Обновление: ${timeToNextUpdate}`}
-    </div>
-    <button on:click={() => soundEnabled = !soundEnabled} class="text-xl opacity-70 hover:opacity-100 transition-opacity">
-      {#if soundEnabled} 🔊 {:else} 🔇 {/if}
-    </button>
-    <button on:click={toggleTheme} class="text-xl p-2 rounded-full bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors">
-      {#if isDark} 🌙 {:else} ☀️ {/if}
-    </button>
-  </div>
-</header>
-
-<main class="max-w-7xl mx-auto p-6 flex flex-col gap-6 text-slate-900 dark:text-slate-100">
-  {#if data.length === 0}
-    <div class="flex flex-col gap-3 justify-center items-center h-64 text-slate-500 font-mono">
-      <div class="w-8 h-8 border-4 border-blue-500 border-t-transparent rounded-full animate-spin"></div>
-      Подключение к серверу и первый опрос оборудования...
-    </div>
-  {:else}
-    <div class="flex gap-3 overflow-x-auto pb-2 scrollbar-hide">
-      {#each data as olt, i}
-        {@const devOnus = olt.ports?.flatMap(p => p.onus) || []}
-        {@const devTotal = devOnus.length}
-        {@const devOnline = devOnus.filter(o => o.state === 'working').length}
-        {@const devLos = devOnus.filter(o => o.state === 'LOS').length}
-        {@const isCrit = devLos > (devTotal * 0.15)}
-        {@const statusText = isCrit ? 'Критично' : (devLos > 0 ? 'Авария' : (devTotal === 0 ? 'Нет данных' : 'В норме'))}
-        {@const statusColor = isCrit ? 'text-red-500' : (devLos > 0 ? 'text-amber-500' : (devTotal===0 ? 'text-slate-400' : 'text-emerald-500'))}
-        {@const dotColor = isCrit ? 'bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.8)]' : (devLos > 0 ? 'bg-amber-500 shadow-[0_0_8px_rgba(245,158,11,0.8)]' : (devTotal===0 ? 'bg-slate-400' : 'bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.8)]'))}
-
-        <!-- svelte-ignore a11y-click-events-have-key-events -->
-        <div on:click={() => { activeOltIndex = i; portPage = 0; activePort = null; }}
-             class="flex flex-col min-w-[210px] p-3 rounded-xl border cursor-pointer transition-all
-             {activeOltIndex === i ? 'bg-blue-50 dark:bg-blue-900/20 border-blue-500 shadow-sm' : 'bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-700 hover:border-slate-300 dark:hover:border-slate-500'}">
-          <div class="flex items-center justify-between mb-2">
-            <div class="flex items-center gap-2">
-              <div class="w-2.5 h-2.5 rounded-full {dotColor}"></div>
-              <span class="font-mono text-sm font-bold">{olt.ip}</span>
-            </div>
-            <div class="text-xs text-slate-500 font-medium px-2 py-0.5 bg-slate-100 dark:bg-slate-700 rounded-md">
-              {olt.isSwitch ? 'SW' : 'OLT'}
-            </div>
-          </div>
-          <div class="mt-1 pt-2 border-t border-slate-100 dark:border-slate-700/50 flex justify-between items-center text-[13px] font-mono">
-            <div class="text-slate-600 dark:text-slate-300">{devOnline}/{devTotal}</div>
-            <div class="{statusColor} font-bold text-xs">{olt.error ? "Ошибка связи" : statusText}</div>
-          </div>
-        </div>
-      {/each}
-    </div>
-
-    <!-- Поиск и фильтры -->
-    <div class="flex flex-wrap gap-3 items-center">
-      <input type="text" bind:value={searchQuery} on:input={() => portPage = 0} placeholder="Поиск интерфейса или договора..." class="flex-1 min-w-[250px] px-4 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500/50" />
-      <button on:click={() => {globalLosFilter = !globalLosFilter; activePort = null; portPage = 0;}} 
-              class="px-4 py-2 rounded-lg font-medium border {globalLosFilter ? 'bg-red-100 border-red-300 text-red-700 dark:bg-red-900/30 dark:border-red-500/50 dark:text-red-400' : 'bg-white border-slate-200 dark:bg-slate-800 dark:border-slate-700'}">
-        Только аварийные (LOS/Down)
-      </button>
-    </div>
-
-    <!-- Порты -->
-    <div class="flex flex-col gap-3">
-      {#if currentDevice.error}
-        <div class="p-6 text-center text-red-500 bg-red-50 border border-red-200 rounded-xl dark:bg-red-900/20 dark:border-red-800/50">
-          Ошибка при опросе оборудования: {currentDevice.error}
-        </div>
-      {/if}
-
-      {#each paginatedPorts as port (port.name)}
-        {@const losCount = port.onus.filter(o => o.state === 'LOS').length}
-        {@const isAlert = currentDevice.isSwitch ? losCount > port.onus.length / 2 : losCount >= 8}
-        {@const isOpen = activePort && activePort.name === port.name}
-
-        <div class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl overflow-hidden shadow-sm">
-          <!-- svelte-ignore a11y-click-events-have-key-events -->
-          <div class="flex items-center gap-4 p-3.5 cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-700/50" on:click={() => togglePort(port.name)}>
-            <span class="font-mono font-bold w-24 text-sm">{port.name}</span>
-            <div class="flex-1 h-1.5 bg-slate-100 dark:bg-slate-700 rounded-full overflow-hidden">
-              <div class="h-full rounded-full transition-all duration-500 {isAlert ? 'bg-red-500' : losCount > 0 ? 'bg-amber-500' : 'bg-emerald-500'}" style="width: {Math.max((losCount / port.onus.length) * 100, 2)}%;"></div>
-            </div>
-            <div class="text-sm text-slate-500 min-w-[140px] text-right">
-              {losCount} {currentDevice.isSwitch ? 'Down' : 'LOS'} / {port.onus.length}
-            </div>
-          </div>
-          
-          {#if isOpen}
-             {@const filteredOnus = port.onus.filter(o => activePort.filter === 'all' || o.state === activePort.filter)}
-             {@const displayedOnus = filteredOnus.slice(activePort.page * ONU_PER_PAGE, (activePort.page + 1) * ONU_PER_PAGE)}
-             <div class="border-t border-slate-100 dark:border-slate-700 bg-slate-50/50 dark:bg-slate-900/50 p-4">
-                 
-                 <div class="flex flex-wrap gap-2 mb-3">
-                   {#each [{id:'all',l:`Все (${port.onus.length})`}, {id:'working',l:`Online (${port.onus.filter(o=>o.state==='working').length})`}, {id:'LOS',l:`LOS (${port.onus.filter(o=>o.state==='LOS').length})`}, {id:'DyingGasp',l:`Dying Gasp (${port.onus.filter(o=>o.state==='DyingGasp').length})`}, {id:'OffLine',l:`Offline (${port.onus.filter(o=>o.state==='OffLine').length})`}] as f}
-                     <button on:click={() => { activePort.filter = f.id; activePort.page = 0; }} class="px-3 py-1.5 text-xs font-semibold rounded-lg border {activePort.filter === f.id ? 'bg-white shadow-sm dark:bg-slate-700' : 'border-transparent text-slate-500'}">
-                       {f.l}
-                     </button>
-                   {/each}
-                   <button on:click={() => exportCSV(port)} class="ml-auto text-xs font-bold text-blue-600 bg-blue-100 px-3 py-1.5 rounded-lg">📥 CSV</button>
-                 </div>
-
-                 <div class="overflow-x-auto rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800">
-                   <table class="w-full text-left text-sm">
-                     <thead class="bg-slate-50 dark:bg-slate-800/80 text-xs uppercase text-slate-500">
-                       <tr><th class="px-4 py-3">ID</th><th class="px-4 py-3">Договор</th><th class="px-4 py-3 text-right">Статус</th></tr>
-                     </thead>
-                     <tbody class="divide-y divide-slate-100 dark:divide-slate-700/50">
-                       {#each displayedOnus as onu}
-                         <tr class="hover:bg-slate-50 dark:hover:bg-slate-700/30">
-                           <td class="px-4 py-2.5 font-mono text-slate-500">{onu.id}</td>
-                           <td class="px-4 py-2.5 font-medium">{onu.contract}</td>
-                           <td class="px-4 py-2.5 text-right font-semibold {onu.state === 'working' ? 'text-emerald-500' : onu.state === 'LOS' ? 'text-red-500' : 'text-slate-400'}">
-                             {onu.state}
-                           </td>
-                         </tr>
-                       {/each}
-                     </tbody>
-                   </table>
-                 </div>
-             </div>
-          {/if}
-        </div>
-      {/each}
-
-      <!-- Пагинация портов/интерфейсов -->
-      {#if filteredPorts.length > 16}
-        {@const totalPortPages = Math.ceil(filteredPorts.length / 16)}
-        <div class="flex justify-between items-center mt-2 px-1 text-sm text-slate-500 dark:text-slate-400">
-          <span>Интерфейсы {portPage * 16 + 1}–{Math.min((portPage + 1) * 16, filteredPorts.length)} из {filteredPorts.length}</span>
-          <div class="flex gap-1">
-            <button 
-              disabled={portPage === 0} 
-              on:click={() => portPage--} 
-              class="px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors bg-white dark:bg-slate-800">
-              ← Назад
-            </button>
-            <div class="px-3 py-1.5 font-bold bg-white dark:bg-slate-800 rounded-lg border border-slate-200 dark:border-slate-700">
-              {portPage + 1} / {totalPortPages}
-            </div>
-            <button 
-              disabled={portPage >= totalPortPages - 1} 
-              on:click={() => portPage++} 
-              class="px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors bg-white dark:bg-slate-800">
-              Вперед →
-            </button>
-          </div>
-        </div>
-      {/if}
-
-    </div>
-
-    <!-- Метрики подвала -->
-    <div class="grid grid-cols-2 lg:grid-cols-4 gap-4 mt-2">
-      <div class="bg-white dark:bg-slate-800 p-5 rounded-xl border border-slate-200 dark:border-slate-700"><div class="text-sm font-medium text-slate-500">Всего линков</div><div class="text-3xl font-bold">{mTotal}</div></div>
-      <div class="bg-white dark:bg-slate-800 p-5 rounded-xl border border-slate-200 dark:border-slate-700"><div class="text-sm font-medium text-slate-500">В работе</div><div class="text-3xl font-bold text-emerald-500">{mOnline}</div></div>
-      <div class="bg-white dark:bg-slate-800 p-5 rounded-xl border border-slate-200 dark:border-slate-700"><div class="text-sm font-medium text-slate-500">Аварии (LOS)</div><div class="text-3xl font-bold text-red-500">{mLos}</div></div>
-      <div class="bg-white dark:bg-slate-800 p-5 rounded-xl border border-slate-200 dark:border-slate-700"><div class="text-sm font-medium text-slate-500">Dying Gasp</div><div class="text-3xl font-bold text-amber-500">{mDying}</div></div>
-    </div>
-  {/if}
-</main>
+<style>
+  :global(body) { margin: 0; background-color: #f8fafc; height: 100vh; }
+  ::-webkit-scrollbar { width: 4px; }
+  ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 10px; }
+</style>
