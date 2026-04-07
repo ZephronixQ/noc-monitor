@@ -32,13 +32,9 @@
 
 ---
 
-## Скриншоты
+## Визуал
  
-**GPON мониторинг — статусы ONU по портам OLT**
-![GPON Dashboard](docs/screenshots/screen1.png)
- 
-**Switch мониторинг — статус узловых коммутаторов через SNMP**
-![Switch Dashboard](docs/screenshots/screen2.png)
+![Dashboard](docs/screenshots/noc-monitor.gif)
 
 ---
 

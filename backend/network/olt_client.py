@@ -36,9 +36,18 @@ def fetch_all_onu(host):
         for pon_port, onus in ports.items():
             port_onus = []
             for onu_id, state in onus:
-                # ИЗМЕНЕНИЕ ЗДЕСЬ: Парсим договор ТОЛЬКО если статус не 'working' и не 'DyingGasp'
-                desc = get_description(conn, pon_port, onu_id) if state not in ["working", "DyingGasp"] else "—"
+                
+                # Приводим статус к нижнему регистру для надежной проверки
+                safe_state = str(state).lower()
+                
+                # Опрашиваем договор ТОЛЬКО если статус 'los' или 'down'
+                if safe_state in ["los", "down"]:
+                    desc = get_description(conn, pon_port, onu_id)
+                else:
+                    desc = "—" # Для working, offline, dyinggasp и прочих запросы НЕ делаем!
+                
                 port_onus.append({"id": f"{pon_port}:{onu_id}", "contract": desc, "state": state})
+            
             frontend_ports.append({"name": pon_port, "onus": port_onus})
 
         conn.disconnect()

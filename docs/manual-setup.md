@@ -1,7 +1,19 @@
-# Ручной запуск noc-monitor
+# Запуск noc-monitor
 
-> Альтернатива Docker — полная настройка окружения вручную.  
+> Поддерживаются два режима запуска: **Docker** (рекомендуется) и **ручной**.  
 > Актуально для **Windows 11 WSL** и **Linux Debian/Ubuntu**.
+
+---
+
+## Содержание
+
+- [1. Установка WSL и Debian (только для Windows)](#1-установка-wsl-и-debian-только-для-windows)
+- [2. Подготовка системы](#2-подготовка-системы)
+- [3. Настройка MIB-файлов (SNMP)](#3-настройка-mib-файлов-snmp)
+- [4. Клонирование и конфигурация](#4-клонирование-и-конфигурация)
+- [🐳 Запуск через Docker (рекомендуется)](#-запуск-через-docker-рекомендуется)
+- [⚙️ Ручной запуск](#️-ручной-запуск)
+- [Замечания](#замечания)
 
 ---
 
@@ -125,7 +137,161 @@ POLL_INTERVAL_SEC = 1800  # Интервал опроса (секунды), по
 
 ---
 
-## 5. Запуск Backend
+## 🐳 Запуск через Docker (рекомендуется)
+
+Docker-режим не требует ручной установки Python, Node.js и зависимостей. Всё запускается в изолированных контейнерах и поднимается автоматически при старте Windows.
+
+### Включить Systemd в WSL
+
+Без этого Docker не запустится автоматически при старте WSL:
+
+```bash
+sudo nano /etc/wsl.conf
+```
+
+Вставить:
+
+```ini
+[boot]
+systemd=true
+```
+
+Сохранить (`Ctrl+O`, `Enter`, `Ctrl+X`), перезапустить WSL из PowerShell (от администратора):
+
+```powershell
+wsl --shutdown
+```
+
+### Установка Docker в Debian
+
+> Не устанавливайте Docker Desktop для Windows — используйте нативный Docker внутри WSL/Debian.
+
+```bash
+# Удалить старые версии (если были)
+sudo apt-get remove docker docker-engine docker.io containerd runc
+
+# Установить зависимости и добавить репозиторий Docker
+sudo apt-get update
+sudo apt-get install ca-certificates curl gnupg
+sudo install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/debian/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+sudo chmod a+r /etc/apt/keyrings/docker.gpg
+
+echo \
+  "deb [arch="$(dpkg --print-architecture)" signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian \
+  "$(. /etc/os-release && echo "$VERSION_CODENAME")" stable" | \
+  sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+# Установить Docker
+sudo apt-get update
+sudo apt-get install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+# Добавить в автозагрузку внутри Debian
+sudo systemctl enable docker
+
+# Добавить текущего пользователя в группу docker (чтобы не писать sudo)
+sudo usermod -aG docker $USER
+newgrp docker
+```
+
+### Развернуть проект
+
+Проект должен находиться в Linux-файловой системе, а не на Windows-диске (`/mnt/c/...`) — иначе Docker работает нестабильно из-за различий в правах доступа.
+
+```bash
+# Создать директорию в Linux-файловой системе
+sudo mkdir -p /opt/noc-monitor
+sudo chown $USER:$USER /opt/noc-monitor
+
+# Определение пути нынешнего проекта 'noc-monitor'
+pwd
+
+# Скопировать файлы (если проект лежит на Windows-диске)
+cp -r /mnt/c/Users/USER/noc-monitor/* /opt/noc-monitor/
+
+cd /opt/noc-monitor
+
+# Собрать и запустить контейнеры
+docker compose up -d --build
+```
+
+> ⏳ Первая сборка занимает 15–20 минут — Docker скачивает образы и компилирует зависимости. Последующие запуски занимают несколько секунд благодаря кэшу слоёв.
+
+Проверить состояние контейнеров:
+
+```bash
+docker ps
+```
+
+Ожидаемый вывод:
+
+```
+CONTAINER ID   NAME           STATUS         PORTS
+xxxxxxxxxxxx   noc-frontend   Up X minutes   0.0.0.0:80->80/tcp
+xxxxxxxxxxxx   noc-backend    Up X minutes   0.0.0.0:8000->8000/tcp
+```
+
+Интерфейс доступен по адресу: **http://localhost**
+
+### Автозапуск вместе с Windows
+
+Открой **PowerShell от имени администратора** и выполни:
+```powershell
+$trigger1 = New-ScheduledTaskTrigger -AtStartup
+$trigger1.Delay = "PT10S"
+
+$trigger2 = New-ScheduledTaskTrigger -AtStartup
+$trigger2.Delay = "PT30S"
+
+# Задача 1: удерживает WSL живым в фоне (запускается через 10 сек после старта)
+$action1 = New-ScheduledTaskAction -Execute "powershell.exe" -Argument '-WindowStyle Hidden -Command "wsl -d Debian -u root -e bash -c ''while true; do sleep 60; done''"'
+Register-ScheduledTask -TaskName "WSL_KeepAlive" -Action $action1 -Trigger $trigger1 -Settings (New-ScheduledTaskSettingsSet -Hidden -ExecutionTimeLimit 0) -RunLevel Highest -User "$env:USERDOMAIN\$env:USERNAME"
+
+# Задача 2: запуск Docker (запускается через 30 сек, когда WSL уже живой)
+$action2 = New-ScheduledTaskAction -Execute "powershell.exe" -Argument '-WindowStyle Hidden -Command "wsl -d Debian -u root -e bash -c ''service docker start && cd /opt/noc-monitor && docker compose up -d''"'
+Register-ScheduledTask -TaskName "NOC_Autostart" -Action $action2 -Trigger $trigger2 -Settings (New-ScheduledTaskSettingsSet -Hidden) -RunLevel Highest -User "$env:USERDOMAIN\$env:USERNAME"
+```
+
+Проверить созданные задачи:
+```powershell
+Get-ScheduledTask -TaskName "NOC_Autostart"
+Get-ScheduledTask -TaskName "WSL_KeepAlive"
+```
+
+### Управление контейнерами
+
+```bash
+# Перезапустить после изменений в коде
+docker compose up -d --build
+
+# Пересобрать только один сервис
+docker compose up -d --build backend
+
+# Остановить всё
+docker compose down
+
+# Пересобрать без кэша (если изменения не применяются)
+docker compose down
+docker compose build --no-cache backend
+docker compose up -d
+
+# Применить изменение в одном файле без пересборки
+docker cp backend/network/olt_client.py noc-backend:/app/backend/network/olt_client.py
+docker restart noc-backend
+
+# Логи в реальном времени
+docker compose logs -f
+docker logs noc-backend
+docker logs noc-frontend
+```
+
+---
+
+## ⚙️ Ручной запуск
+
+Альтернатива Docker — запуск напрямую через Python и Node.js. Удобно для разработки.
+
+### Запуск Backend
 
 ```bash
 python3 -m venv venv && source venv/bin/activate
@@ -133,9 +299,7 @@ pip install -r requirements.txt
 python3 backend/main.py
 ```
 
----
-
-## 6. Запуск Frontend
+### Запуск Frontend
 
 ```bash
 cd frontend
@@ -153,7 +317,8 @@ npm run dev
 - При `Timeout` во время SNMP-опроса — проверьте community-строку в `inventory.py`
 - Не отключайте порт, через который идёт SNMP-опрос — устройство перестанет отвечать
 - На Debian 13 (trixie) `snmp-mibs-downloader` может отсутствовать — используйте раздел 3.4
+- Проект должен лежать в `/opt/noc-monitor`, а не в `/mnt/c/` — Docker работает нестабильно с Windows-дисками
 
 ---
 
-*Протестировано на Windows 11 + WSL + Debian GNU/Linux 13 (trixie) — 04.04.2026*
+*Протестировано на Windows 11 + WSL + Debian GNU/Linux 13 (trixie) — 07.04.2026*

@@ -1,26 +1,48 @@
-<script>
-  import { onMount } from 'svelte';
-  import { slide, fade } from 'svelte/transition';
+<svelte:head>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</svelte:head>
 
+<script>
+  import { onMount, tick } from 'svelte';
+  import { slide, fade, scale } from 'svelte/transition';
+  
   let host = "localhost"; 
-  onMount(() => { host = window.location.hostname; });
+  let isDark = false;
+  let wsConnected = false;
+
+  // --- ПЕРЕМЕННЫЕ ДЛЯ СТАТИСТИКИ И ИСТОРИИ ---
+  let dailyStats = { total_24h: 0, avg_repair_minutes: 0, active_now: 0 };
+  let selectedEntity = null; 
+  let entityHistory = [];
+  let isHistoryLoading = false;
+  let isModalOpen = false;
+
+  onMount(() => { 
+    host = window.location.hostname; 
+    const storedTheme = localStorage.getItem('noc-theme');
+    if (storedTheme) isDark = storedTheme === 'dark';
+    else isDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+  });
+
+  function toggleTheme() {
+    isDark = !isDark;
+    localStorage.setItem('noc-theme', isDark ? 'dark' : 'light');
+  }
 
   $: BACKEND_URL = `http://${host}:8000`;
   $: WS_URL = `ws://${host}:8000/ws`;
 
   let activeTab = 'dash'; 
   let activeOltIndex = 0;
-  let activeFolderIndex = 0; // Индекс для папок коммутаторов
+  let activeFolderIndex = 0;
   
-  // Независимые поисковые запросы
-  let searchQuery = ''; // Для OLT
-  let switchSearchQuery = ''; // Для Коммутаторов
+  let searchQuery = ''; 
+  let switchSearchQuery = ''; 
   
   let globalLosFilter = false;
   let activePort = null;
-  let subFilter = 'all'; // all, online, los, dying, offline
+  let subFilter = 'all'; 
 
-  // Пагинация для OLT
   let currentPage = 1;
   const itemsPerPage = 16;
 
@@ -29,91 +51,253 @@
   let timeToNextUpdate = "00:00";
   let isUpdating = true;
 
-  // --- ДАННЫЕ OLT ---
+  let currentUnixTime = Math.floor(Date.now() / 1000);
+  setInterval(() => { currentUnixTime = Math.floor(Date.now() / 1000); }, 60000);
+
+  // --- API ВЫЗОВЫ ---
+  async function fetchDailyStats() {
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/stats/daily`);
+      dailyStats = await res.json();
+    } catch(e) { console.error("Ошибка загрузки отчета:", e); }
+  }
+
+let activeHistoryRequest = null; // Храним контроллер текущего запроса
+  async function openHistory(contract, id, type = 'sw') {
+    if (type !== 'sw') return; 
+    if (!contract || contract === '—') return;
+    
+    // Если уже идет загрузка, игнорируем новые клики
+    if (isHistoryLoading) return;
+    
+    selectedEntity = { contract, id, type };
+    isHistoryLoading = true;
+    isModalOpen = true;
+    
+    try {
+      const controller = new AbortController();
+      activeHistoryRequest = controller; // Запоминаем для отмены
+      
+      const timeoutId = setTimeout(() => {
+        controller.abort(); // Отмена если сервер молчит > 5 сек
+      }, 5000); 
+
+      const res = await fetch(`${BACKEND_URL}/api/history/${encodeURIComponent(id)}?days=30`, {
+        signal: controller.signal,
+        cache: 'no-store' // Запрещаем браузеру кэшировать сломанные ответы
+      });
+      
+      clearTimeout(timeoutId);
+
+      if (!res.ok) throw new Error(`Ошибка сервера: ${res.status}`);
+      
+      const json = await res.json();
+      entityHistory = json.incidents || []; 
+      
+    } catch(e) {
+      console.error("❌ Ошибка загрузки истории:", e);
+      entityHistory = []; 
+    } finally {
+      isHistoryLoading = false; 
+      activeHistoryRequest = null;
+    }
+  }
+
+  function closeHistory() {
+    // Если юзер нажал "крестик" ДО того как загрузилось, принудительно обрываем запрос к серверу!
+    if (activeHistoryRequest) {
+      activeHistoryRequest.abort();
+      activeHistoryRequest = null;
+    }
+    
+    isModalOpen = false;
+    setTimeout(() => { 
+      selectedEntity = null; 
+      entityHistory = []; 
+      isHistoryLoading = false; // Очищаем статус загрузки
+    }, 300);
+  }
+
+  // Функция экспорта в CSV
+  function exportPortCsv(port) {
+    if (!port || !port.onus) return;
+    let csvContent = "data:text/csv;charset=utf-8,";
+    csvContent += "ID,Договор/Адрес,Статус\n";
+    port.onus.forEach(onu => {
+      const id = onu.id || '';
+      const contract = onu.contract || '';
+      const state = onu.state || '';
+      csvContent += `"${id}","${contract}","${state}"\n`;
+    });
+    const encodedUri = encodeURI(csvContent);
+    const link = document.createElement("a");
+    link.setAttribute("href", encodedUri);
+    link.setAttribute("download", `export_port_${port.name}.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  }
+
+  // --- ДАННЫЕ СЕТИ ---
   $: olts = data.filter(d => !d.isSwitch);
   $: currentOlt = olts[activeOltIndex] || { ports: [] };
 
-  // Фильтрация портов OLT
-  $: filteredPorts = currentOlt.ports?.filter(port => {
-    const hasLos = port.onus.some(o => ['LOS', 'Down'].includes(o.state));
-    if (globalLosFilter && !hasLos) return false;
-    
-    if (!searchQuery) return true;
-    const q = searchQuery.toLowerCase();
-    return port.name.toLowerCase().includes(q) || 
-           port.onus.some(o => (o.contract || '').toLowerCase().includes(q));
-  }) || [];
+  $: filteredPorts = (currentOlt.ports || [])
+    .filter(port => {
+      const hasLos = port.onus.some(o => ['los', 'down'].includes((o.state||'').toLowerCase()));
+      if (globalLosFilter && !hasLos) return false;
+      if (!searchQuery) return true;
+      const q = searchQuery.toLowerCase();
+      return port.name.toLowerCase().includes(q) || port.onus.some(o => (o.contract || '').toLowerCase().includes(q));
+    })
+    .sort((a, b) => {
+      if (a.is_mass_outage && !b.is_mass_outage) return -1;
+      if (!a.is_mass_outage && b.is_mass_outage) return 1;
+      const badA = a.onus.filter(o => ['los', 'down'].includes((o.state||'').toLowerCase())).length;
+      const badB = b.onus.filter(o => ['los', 'down'].includes((o.state||'').toLowerCase())).length;
+      return badB - badA; 
+    });
 
   $: paginatedPorts = filteredPorts.slice((currentPage - 1) * itemsPerPage, currentPage * itemsPerPage);
   $: totalPages = Math.ceil(filteredPorts.length / itemsPerPage);
 
-
-  // --- ДАННЫЕ КОММУТАТОРОВ (С ПАПКАМИ) ---
   $: switchDataNode = data.find(d => d.isSwitch) || { ports: [] };
   $: switchFolders = switchDataNode.ports || [];
-  
-  // Плоский список всех коммутаторов
   $: allSwitchesFlat = switchFolders.flatMap(folder => folder.onus || []);
-  
-  // Текущая активная папка
   $: currentSwitchFolder = switchFolders[activeFolderIndex] || { onus: [] };
 
-  // Если есть текст в поиске - ищем по ВСЕМ папкам плоским списком. Если нет - показываем выбранную папку.
   $: displayedSwitches = switchSearchQuery 
     ? allSwitchesFlat.filter(sw => sw.id.toLowerCase().includes(switchSearchQuery.toLowerCase()) || (sw.contract || '').toLowerCase().includes(switchSearchQuery.toLowerCase()))
     : currentSwitchFolder.onus || [];
 
-
-  // --- СТАТИСТИКА (ОБЗОР) ---
   $: totalStats = {
     onus: olts.reduce((acc, olt) => acc + olt.ports.flatMap(p => p.onus).length, 0),
     online: olts.reduce((acc, olt) => acc + olt.ports.flatMap(p => p.onus).filter(o => o.state === 'working').length, 0),
-    los: olts.reduce((acc, olt) => acc + olt.ports.flatMap(p => p.onus).filter(o => ['LOS', 'Down'].includes(o.state)).length, 0),
+    los: olts.reduce((acc, olt) => acc + olt.ports.flatMap(p => p.onus).filter(o => ['los', 'down'].includes((o.state||'').toLowerCase())).length, 0),
     olts: olts.length,
     switches: allSwitchesFlat.length,
-    swUp: allSwitchesFlat.filter(sw => sw.state === 'working' || sw.state === 'Host is alive').length
+    swUp: allSwitchesFlat.filter(sw => sw.state === 'working' || sw.state === 'Host is alive').length,
+    massOlt: olts.reduce((acc, olt) => acc + olt.ports.filter(p => p.is_mass_outage).length, 0),
+    massSw: switchFolders.filter(f => f.is_mass_outage).length
   };
 
+  // --- ГРАФИКИ ---
+  let chartCanvas;
+  let chartInstance = null;
+  let historyLabels = [];
+  let historyData = [];
 
-  // --- ФУНКЦИИ ---
+  $: if (chartInstance) updateChartTheme(isDark);
+
+  // Умная инициализация графика (ждет загрузки Chart.js из интернета)
+  function chartSetup(node) {
+    chartCanvas = node;
+    const checkChart = setInterval(() => {
+      if (window.Chart) {
+        clearInterval(checkChart);
+        initChart();
+      }
+    }, 50);
+
+    return {
+      destroy() {
+        if (chartInstance) {
+          chartInstance.destroy();
+          chartInstance = null;
+        }
+        clearInterval(checkChart);
+      }
+    };
+  }
+
+  function updateChartTheme(dark) {
+    if (!chartInstance) return;
+    const gridColor = dark ? 'rgba(255, 255, 255, 0.05)' : 'rgba(0, 0, 0, 0.05)';
+    const textColor = dark ? '#94a3b8' : '#64748b';
+    const lineColor = dark ? '#6366f1' : '#4f46e5';
+    const bgColor = dark ? 'rgba(99, 102, 241, 0.2)' : 'rgba(79, 70, 229, 0.1)';
+
+    chartInstance.data.datasets[0].borderColor = lineColor;
+    chartInstance.data.datasets[0].backgroundColor = bgColor;
+    chartInstance.data.datasets[0].pointBackgroundColor = dark ? '#1e293b' : '#ffffff';
+    chartInstance.data.datasets[0].pointBorderColor = lineColor;
+    
+    if(!chartInstance.options.scales.x) chartInstance.options.scales.x = { grid: {}, ticks: {} };
+    if(!chartInstance.options.scales.y) chartInstance.options.scales.y = { beginAtZero: true, suggestedMin: 0, grid: {}, ticks: {} };
+    
+    chartInstance.options.scales.x.grid.color = gridColor;
+    chartInstance.options.scales.x.ticks.color = textColor;
+    chartInstance.options.scales.y.grid.color = gridColor;
+    chartInstance.options.scales.y.ticks.color = textColor;
+    chartInstance.update();
+  }
+
+  function initChart() {
+    if (!chartCanvas) return;
+    chartInstance = new Chart(chartCanvas, {
+      type: 'line',
+      data: { labels: historyLabels, datasets: [{ label: 'LOS', data: historyData, fill: true, tension: 0.4, borderWidth: 3, pointRadius: 4 }] },
+      options: { responsive: true, maintainAspectRatio: false, animation: false, plugins: { legend: { display: false }, tooltip: { mode: 'index', intersect: false } }, interaction: { mode: 'nearest', axis: 'x', intersect: false } }
+    });
+    updateChartTheme(isDark);
+  }
+
+  // Просто обновляет визуальную часть, не добавляя новые точки (используется при загрузке страницы)
+  function redrawChart() {
+    if (chartInstance) {
+      chartInstance.data.labels = historyLabels;
+      chartInstance.data.datasets[0].data = historyData;
+      chartInstance.update();
+    }
+  }
+
+  // Добавляет новую точку в массив, сохраняет и рисует
+  async function updateChartData() {
+    await tick(); 
+    const now = new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+    
+    // Защита от дублирования точек при частых обновлениях (заменяет последнюю, если время совпадает)
+    if (historyLabels.length > 0 && historyLabels[historyLabels.length - 1] === now) {
+      historyData[historyData.length - 1] = totalStats.los;
+    } else {
+      if (historyLabels.length > 30) { historyLabels.shift(); historyData.shift(); }
+      historyLabels.push(now);
+      historyData.push(totalStats.los);
+    }
+    
+    localStorage.setItem('noc_chart_labels', JSON.stringify(historyLabels));
+    localStorage.setItem('noc_chart_data', JSON.stringify(historyData));
+
+    redrawChart();
+  }
 
   const setTab = (tab) => { 
-    activeTab = tab; 
-    activePort = null; 
-    currentPage = 1; 
+    activeTab = tab; activePort = null; currentPage = 1; 
   };
   
-  const exportPortCsv = (port) => {
-    const headers = "ID,Contract,State\n";
-    const rows = port.onus.map(o => `${o.id},${o.contract || '—'},${o.state}`).join("\n");
-    const blob = new Blob([headers + rows], { type: 'text/csv' });
-    const url = window.URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `port_${port.name.replace(/\//g, '_')}.csv`;
-    a.click();
-  };
-
-  const exportJson = () => {
-    const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(data, null, 2));
-    const downloadAnchorNode = document.createElement('a');
-    downloadAnchorNode.setAttribute("href", dataStr);
-    downloadAnchorNode.setAttribute("download", "noc_export.json");
-    document.body.appendChild(downloadAnchorNode);
-    downloadAnchorNode.click();
-    downloadAnchorNode.remove();
+  const formatLosTime = (startTs) => {
+    if (!startTs) return '';
+    const diff = currentUnixTime - startTs;
+    if (diff < 0) return 'Только что';
+    const h = Math.floor(diff / 3600);
+    const m = Math.floor((diff % 3600) / 60);
+    return h > 0 ? `${h}ч ${m}м` : `${m}м`;
   };
 
   const getStatusColor = (state) => {
-    if (state === 'working' || state === 'Host is alive') return 'text-emerald-500';
-    if (state === 'DyingGasp') return 'text-orange-500';
+    if (!state) return 'text-slate-500';
+    const s = state.toLowerCase();
+    if (s === 'working' || s === 'host is alive') return 'text-emerald-500';
+    if (s === 'dyinggasp') return 'text-orange-500';
     return 'text-red-500';
   };
 
   const getDotColor = (state) => {
-    if (state === 'working' || state === 'Host is alive') return 'bg-emerald-500';
-    if (state === 'DyingGasp') return 'bg-orange-500';
-    return 'bg-red-500';
+    if (!state) return 'bg-slate-500';
+    const s = state.toLowerCase();
+    if (s === 'working' || s === 'host is alive') return 'bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.5)]';
+    if (s === 'dyinggasp') return 'bg-orange-500 shadow-[0_0_8px_rgba(249,115,22,0.5)]';
+    return 'bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.5)] animate-pulse';
   };
 
   function updateTimer() {
@@ -122,247 +306,456 @@
     timeToNextUpdate = diff <= 0 ? "00:00" : `${Math.floor(diff/60)}:${(diff%60).toString().padStart(2,'0')}`;
   }
 
+let ws;
+  function connectWebSocket() {
+    if (ws) ws.close();
+    ws = new WebSocket(WS_URL);
+    ws.onopen = () => { wsConnected = true; };
+    ws.onmessage = async (e) => {
+      const msg = JSON.parse(e.data);
+      if (msg.type === "update") {
+        data = msg.data; nextUpdateTs = msg.next_update; isUpdating = msg.is_updating;
+        // Добавляем новую точку только при реальном обновлении данных по WS
+        if (!msg.is_sw_only) await updateChartData();
+      }
+    };
+    ws.onclose = () => {
+      wsConnected = false; 
+      setTimeout(connectWebSocket, 1000);
+    };
+    ws.onerror = () => { ws.close(); };
+  }
+
   onMount(async () => {
+    // 1. Восстанавливаем график из памяти
+    try {
+      const savedLabels = localStorage.getItem('noc_chart_labels');
+      const savedData = localStorage.getItem('noc_chart_data');
+      if (savedLabels && savedData) {
+        historyLabels = JSON.parse(savedLabels);
+        historyData = JSON.parse(savedData);
+      }
+    } catch(e) { console.error("Ошибка чтения истории графика:", e); }
+
+    // 2. Первичная загрузка данных (без добавления новой точки на график)
     try {
       const res = await fetch(`${BACKEND_URL}/api/data`);
       const json = await res.json();
       data = json.data; nextUpdateTs = json.next_update; isUpdating = json.is_updating;
+      await tick();
+      redrawChart(); // Просто перерисовываем то, что загрузили из памяти
     } catch(e) {}
 
-    const ws = new WebSocket(WS_URL);
-    ws.onmessage = (e) => {
-      const msg = JSON.parse(e.data);
-      if (msg.type === "update") {
-        data = msg.data; nextUpdateTs = msg.next_update; isUpdating = msg.is_updating;
-      }
-    };
+    fetchDailyStats();
+    setInterval(fetchDailyStats, 300000); // Обновлять стату раз в 5 минут
+    connectWebSocket();
     setInterval(updateTimer, 1000);
   });
 </script>
 
-<div class="min-h-screen bg-slate-50 text-slate-900 font-sans flex flex-col">
-  <header class="bg-[#1e293b] text-white h-14 flex items-center justify-between px-6 sticky top-0 z-50 shadow-md">
+<!-- Модальное окно истории -->
+{#if isModalOpen}
+  <div class="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm" in:fade={{duration: 200}} out:fade={{duration: 200}}>
+    <div class="w-full max-w-2xl rounded-3xl shadow-2xl overflow-hidden flex flex-col max-h-[85vh] {isDark ? 'bg-slate-900 border border-slate-700' : 'bg-white'}" in:scale={{start: 0.95, duration: 200}}>
+      
+      <!-- Хедер модалки -->
+      <div class="px-6 py-5 border-b flex justify-between items-center bg-gradient-to-r {isDark ? 'from-slate-800 to-slate-900 border-slate-700' : 'from-slate-50 to-white border-slate-200'}">
+        <div>
+          <h2 class="text-lg font-black tracking-tight {isDark ? 'text-white' : 'text-slate-900'}">История подключений</h2>
+          <div class="text-xs font-bold text-indigo-500 mt-1">{selectedEntity?.contract} <span class="text-slate-400">({selectedEntity?.id})</span></div>
+        </div>
+        <button on:click={closeHistory} class="w-8 h-8 flex items-center justify-center rounded-full bg-slate-200/50 hover:bg-slate-300 transition-colors {isDark ? 'bg-slate-800 text-slate-400 hover:text-white' : 'text-slate-600'}">✕</button>
+      </div>
+
+      <!-- Тело модалки -->
+      <div class="p-6 overflow-y-auto flex-1 {isDark ? 'bg-slate-900' : 'bg-slate-50'} always-visible-scroll">
+        {#if isHistoryLoading}
+          <div class="flex flex-col items-center justify-center py-12 opacity-50">
+            <div class="w-8 h-8 border-4 border-indigo-500 border-t-transparent rounded-full animate-spin mb-4"></div>
+            <span class="text-sm font-bold {isDark ? 'text-slate-400' : 'text-slate-500'}">Загрузка данных из БД...</span>
+          </div>
+        {:else if entityHistory.length === 0}
+          <div class="text-center py-12">
+            <div class="text-4xl mb-2">✨</div>
+            <h3 class="text-sm font-bold {isDark ? 'text-slate-300' : 'text-slate-700'}">Идеальная связь</h3>
+            <p class="text-xs mt-1 {isDark ? 'text-slate-500' : 'text-slate-400'}">За последние 30 дней падений не зафиксировано.</p>
+          </div>
+        {:else}
+          <div class="space-y-4 relative before:absolute before:inset-0 before:ml-5 before:-translate-x-px md:before:mx-auto md:before:translate-x-0 before:h-full before:w-0.5 before:bg-gradient-to-b before:from-transparent before:via-slate-300 before:to-transparent {isDark ? 'before:via-slate-700' : ''}">
+            {#each entityHistory as event}
+              <div class="relative flex items-center justify-between md:justify-normal md:odd:flex-row-reverse group is-active">
+                <div class="flex items-center justify-center w-10 h-10 rounded-full border-4 shrink-0 md:order-1 md:group-odd:-translate-x-1/2 md:group-even:translate-x-1/2 shadow-sm {event.end_time ? (isDark ? 'bg-slate-800 border-slate-700' : 'bg-white border-slate-200') : 'bg-red-500 border-red-200 animate-pulse'}">
+                  <span class="text-xs">{event.end_time ? '✅' : '🚨'}</span>
+                </div>
+                
+                <div class="w-[calc(100%-4rem)] md:w-[calc(50%-2.5rem)] p-4 rounded-2xl border shadow-sm transition-colors {isDark ? 'bg-slate-800 border-slate-700' : 'bg-white border-slate-200'}">
+                  <div class="flex justify-between items-center mb-1">
+                    <span class="text-[10px] font-black uppercase {event.end_time ? 'text-emerald-500' : 'text-red-500'}">
+                      {event.end_time ? 'Восстановлено' : 'АКТИВНАЯ АВАРИЯ'}
+                    </span>
+                    <span class="text-[10px] font-bold px-2 py-0.5 rounded bg-slate-100 {isDark ? 'bg-slate-700 text-slate-300' : 'text-slate-600'}">
+                      {Math.floor(event.duration / 60)} мин
+                    </span>
+                  </div>
+                  <div class="text-xs font-bold {isDark ? 'text-slate-300' : 'text-slate-700'}">Начало: <span class="font-normal">{event.start_human}</span></div>
+                  {#if event.end_time}
+                    <div class="text-xs font-bold {isDark ? 'text-slate-300' : 'text-slate-700'}">Конец: <span class="font-normal">{event.end_human}</span></div>
+                  {/if}
+                </div>
+              </div>
+            {/each}
+          </div>
+        {/if}
+      </div>
+    </div>
+  </div>
+{/if}
+
+<div class="h-screen w-full overflow-hidden font-sans flex flex-col transition-colors duration-200 {isDark ? 'bg-[#0b1120] text-slate-200' : 'bg-slate-50 text-slate-900'}">
+  <header class="h-14 shrink-0 flex items-center justify-between px-6 sticky top-0 z-40 shadow-sm backdrop-blur-md border-b {isDark ? 'bg-slate-900/80 border-slate-800' : 'bg-white/80 border-slate-200'}">
     <div class="flex items-center gap-8">
       <div class="flex items-center gap-2">
-        <div class="w-8 h-8 bg-indigo-500 rounded flex items-center justify-center font-bold">N</div>
-        <span class="font-bold tracking-tight text-lg italic">NOC VISION</span>
+        <div class="w-8 h-8 rounded-lg flex items-center justify-center font-black text-white bg-gradient-to-br from-indigo-500 to-purple-600 shadow-md">N</div>
+        <span class="font-black tracking-tight text-lg {isDark ? 'text-white' : 'text-slate-900'}">NOC <span class="text-indigo-500">MONITOR</span></span>
       </div>
-      
-      <nav class="flex gap-1 bg-slate-800 p-1 rounded-lg">
-        <button on:click={() => setTab('dash')} class="px-4 py-1 rounded text-[11px] font-bold transition-all {activeTab === 'dash' ? 'bg-indigo-500 shadow' : 'text-slate-400 hover:text-white'}">ОБЗОР</button>
-        <button on:click={() => setTab('olt')} class="px-4 py-1 rounded text-[11px] font-bold transition-all {activeTab === 'olt' ? 'bg-indigo-500 shadow' : 'text-slate-400 hover:text-white'}">GPON</button>
-        <button on:click={() => setTab('sw')} class="px-4 py-1 rounded text-[11px] font-bold transition-all {activeTab === 'sw' ? 'bg-indigo-500 shadow' : 'text-slate-400 hover:text-white'}">КОММУТАТОРЫ</button>
+      <nav class="flex gap-1 p-1 rounded-lg {isDark ? 'bg-slate-800/50' : 'bg-slate-100'}">
+        <button on:click={() => setTab('dash')} class="px-5 py-1.5 rounded-md text-[11px] font-black tracking-wide transition-all {activeTab === 'dash' ? 'bg-indigo-500 text-white shadow-md' : 'text-slate-500 hover:text-indigo-500'}">ОБЗОР</button>
+        <button on:click={() => setTab('olt')} class="px-5 py-1.5 rounded-md text-[11px] font-black tracking-wide transition-all {activeTab === 'olt' ? 'bg-indigo-500 text-white shadow-md' : 'text-slate-500 hover:text-indigo-500'}">GPON</button>
+        <button on:click={() => setTab('sw')} class="px-5 py-1.5 rounded-md text-[11px] font-black tracking-wide transition-all {activeTab === 'sw' ? 'bg-indigo-500 text-white shadow-md' : 'text-slate-500 hover:text-indigo-500'}">КОММУТАТОРЫ</button>
       </nav>
     </div>
-
+    
     <div class="flex items-center gap-4">
-      <button on:click={exportJson} class="text-[10px] bg-slate-700 hover:bg-slate-600 px-3 py-1 rounded font-bold transition-colors">JSON EXPORT</button>
-      <div class="font-mono text-[11px] text-slate-400">СЛЕД. ОПРОС: <span class="text-indigo-400">{timeToNextUpdate}</span></div>
+      <button on:click={toggleTheme} class="w-8 h-8 rounded-full flex items-center justify-center transition-colors {isDark ? 'bg-slate-800 text-yellow-400 hover:bg-slate-700' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}">
+        {#if isDark} ☀️ {:else} 🌙 {/if}
+      </button>
+      <div class="flex items-center gap-3 border-l pl-4 {isDark ? 'border-slate-700' : 'border-slate-200'}">
+        <div class="flex items-center gap-2" title={wsConnected ? 'Connected' : 'Disconnected'}>
+          <div class="relative flex h-2.5 w-2.5">
+            {#if wsConnected}
+              <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+              <span class="relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-500"></span>
+            {:else}
+              <span class="relative inline-flex rounded-full h-2.5 w-2.5 bg-red-500"></span>
+            {/if}
+          </div>
+          <span class="text-[10px] font-black tracking-wider {wsConnected ? 'text-emerald-500' : 'text-red-500'}">{wsConnected ? 'ONLINE' : 'OFFLINE'}</span>
+        </div>
+        <div class="font-mono text-[10px] font-bold {isDark ? 'text-slate-400' : 'text-slate-500'}">ОПРОС: <span class="text-indigo-500">{timeToNextUpdate}</span></div>
+      </div>
     </div>
   </header>
 
-  <main class="p-6 flex-1 overflow-hidden flex flex-col">
+  <main class="p-6 flex-1 overflow-hidden flex flex-col min-h-0">
+    
     <!-- ВКЛАДКА: ОБЗОР -->
     {#if activeTab === 'dash'}
-      <div class="grid grid-cols-3 gap-6" in:fade>
-        <div class="bg-white p-8 rounded-3xl border border-slate-200 shadow-sm">
-          <span class="text-xs font-bold text-slate-400 uppercase tracking-widest">Клиенты (ONU)</span>
-          <div class="text-5xl font-black mt-2 text-slate-800">{totalStats.onus}</div>
-          <div class="mt-4 h-2 bg-slate-100 rounded-full overflow-hidden">
-            <div class="bg-indigo-500 h-full" style="width: {(totalStats.online/totalStats.onus)*100}%"></div>
+      <div class="flex flex-col gap-6 h-full min-h-0" in:fade>
+        
+        <!-- ТОП ПАНЕЛЬ С КАРТОЧКАМИ (4 КОЛОНКИ) -->
+        <div class="grid grid-cols-4 gap-6 h-40 shrink-0">
+          
+          <!-- Клиенты -->
+          <div class="relative p-6 rounded-3xl overflow-hidden shadow-sm flex flex-col justify-between group {isDark ? 'bg-gradient-to-br from-slate-800 to-slate-900 border border-slate-700' : 'bg-white border border-slate-200'}">
+            <div class="absolute top-0 right-0 p-4 opacity-10 transform translate-x-4 -translate-y-4 group-hover:scale-110 transition-transform duration-500">
+               <svg class="w-24 h-24" fill="currentColor" viewBox="0 0 24 24"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>
+            </div>
+            <span class="text-[10px] font-black text-slate-400 uppercase tracking-widest relative z-10">Клиенты (GPON)</span>
+            <div class="relative z-10">
+              <div class="text-5xl font-black {isDark ? 'text-white' : 'text-slate-900'}">{totalStats.onus}</div>
+              <div class="mt-3 flex items-center gap-3">
+                <div class="flex-1 h-1.5 rounded-full overflow-hidden bg-slate-200/20 {isDark ? 'bg-slate-700' : 'bg-slate-100'}">
+                  <div class="bg-emerald-500 h-full shadow-[0_0_10px_rgba(16,185,129,0.8)]" style="width: {(totalStats.online/totalStats.onus)*100}%"></div>
+                </div>
+                <span class="text-xs font-bold text-red-500">{totalStats.los} LOS</span>
+              </div>
+            </div>
           </div>
-          <div class="mt-2 text-xs font-bold text-emerald-500">{((totalStats.online/totalStats.onus)*100).toFixed(1)}% Up</div>
-        </div>
-        <div class="bg-white p-8 rounded-3xl border border-slate-200 shadow-sm">
-          <span class="text-xs font-bold text-slate-400 uppercase tracking-widest">Коммутаторы</span>
-          <div class="text-5xl font-black mt-2 text-slate-800">{totalStats.swUp}/{totalStats.switches}</div>
-          <div class="mt-4 flex gap-1">
-             {#each Array(totalStats.switches) as _, i}
-               <div class="h-2 flex-1 rounded-full {i < totalStats.swUp ? 'bg-emerald-400' : 'bg-red-400'}"></div>
-             {/each}
+
+          <!-- Коммутаторы -->
+          <div class="relative p-6 rounded-3xl overflow-hidden shadow-sm flex flex-col justify-between group {isDark ? 'bg-gradient-to-br from-slate-800 to-slate-900 border border-slate-700' : 'bg-white border border-slate-200'}">
+            <div class="absolute top-0 right-0 p-4 opacity-10 transform translate-x-4 -translate-y-4 group-hover:scale-110 transition-transform duration-500">
+               <svg class="w-24 h-24" fill="currentColor" viewBox="0 0 24 24"><path d="M4 10h3v7H4zM10.5 10h3v7h-3zM2 19h20v3H2zM17 10h3v7h-3zM12 1v8h-1V1zM8 1v8H7V1zM16 1v8h-1V1z"/></svg>
+            </div>
+            <span class="text-[10px] font-black text-slate-400 uppercase tracking-widest relative z-10">Оборудование (SW)</span>
+            <div class="relative z-10">
+              <div class="flex items-baseline gap-2">
+                <div class="text-5xl font-black {isDark ? 'text-white' : 'text-slate-900'}">{totalStats.swUp}</div>
+                <div class="text-lg font-bold text-slate-500">/ {totalStats.switches}</div>
+              </div>
+              <div class="mt-3 text-xs font-bold {totalStats.switches - totalStats.swUp > 0 ? 'text-red-500' : 'text-emerald-500'}">
+                {totalStats.switches - totalStats.swUp} Узлов недоступно
+              </div>
+            </div>
           </div>
-          <div class="mt-2 text-xs font-bold text-red-500">{totalStats.switches - totalStats.swUp} Down</div>
+
+          <!-- Аварии сети -->
+          <div class="p-6 rounded-3xl border shadow-sm flex flex-col justify-center {isDark ? 'bg-gradient-to-br from-slate-800 to-slate-900 border-slate-700' : 'bg-white border-slate-200'}">
+            <span class="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-4">Статус локаций</span>
+            <div class="space-y-3">
+              <div class="flex justify-between items-center">
+                <span class="text-xs font-bold {isDark ? 'text-slate-300' : 'text-slate-600'}">Массовые GPON:</span>
+                <span class="text-xs font-black px-2 py-0.5 rounded-md {totalStats.massOlt > 0 ? 'bg-red-500 text-white shadow-[0_0_10px_rgba(239,68,68,0.5)] animate-pulse' : (isDark ? 'bg-slate-800 text-emerald-500 border border-slate-700' : 'bg-emerald-50 text-emerald-600 border border-emerald-100')}">
+                  {totalStats.massOlt} ОЧАГОВ
+                </span>
+              </div>
+              <div class="flex justify-between items-center">
+                <span class="text-xs font-bold {isDark ? 'text-slate-300' : 'text-slate-600'}">Массовые SW:</span>
+                <span class="text-xs font-black px-2 py-0.5 rounded-md {totalStats.massSw > 0 ? 'bg-red-500 text-white shadow-[0_0_10px_rgba(239,68,68,0.5)] animate-pulse' : (isDark ? 'bg-slate-800 text-emerald-500 border border-slate-700' : 'bg-emerald-50 text-emerald-600 border border-emerald-100')}">
+                  {totalStats.massSw} ЛОКАЦИЙ
+                </span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Отчет за сутки -->
+          <div class="p-6 rounded-3xl border shadow-sm flex flex-col justify-center relative overflow-hidden {isDark ? 'bg-gradient-to-br from-indigo-900/40 to-slate-900 border-indigo-500/30' : 'bg-gradient-to-br from-indigo-50 to-white border-indigo-200'}">
+            <div class="absolute -right-6 -top-6 w-24 h-24 bg-indigo-500/20 rounded-full blur-2xl"></div>
+            <span class="text-[10px] font-black text-indigo-400 uppercase tracking-widest mb-3">Суточный Отчет (24ч)</span>
+            
+            <div class="flex justify-between items-end mb-2 border-b pb-2 {isDark ? 'border-slate-700' : 'border-indigo-100'}">
+              <span class="text-xs font-bold {isDark ? 'text-slate-300' : 'text-slate-600'}">Всего за 24 часа:</span>
+              <span class="text-lg font-black text-indigo-500">{dailyStats.total_24h}</span>
+            </div>
+            <div class="flex justify-between items-end">
+              <span class="text-xs font-bold {isDark ? 'text-slate-300' : 'text-slate-600'}">Активно сейчас:</span>
+              <span class="text-sm font-black px-2 py-0.5 rounded-md {(totalStats.switches - totalStats.swUp) > 0 ? 'bg-red-500 text-white shadow-[0_0_8px_rgba(239,68,68,0.6)] animate-pulse' : (isDark ? 'bg-slate-800 text-emerald-500' : 'bg-emerald-50 text-emerald-600')}">
+                {totalStats.switches - totalStats.swUp}
+              </span>
+            </div>
+          </div>
+
         </div>
-        <div class="bg-white p-8 rounded-3xl border border-slate-200 shadow-sm">
-          <span class="text-xs font-bold text-slate-400 uppercase tracking-widest">Активные OLT</span>
-          <div class="text-5xl font-black mt-2 text-slate-800">{totalStats.olts}</div>
-          <p class="text-xs text-slate-400 mt-4 font-bold">Все системы мониторинга стабильны</p>
+
+        <!-- ГРАФИК (Используем use:chartSetup) -->
+        <div class="flex-1 p-6 min-h-0 rounded-3xl border shadow-sm flex flex-col relative {isDark ? 'bg-slate-900 border-slate-700' : 'bg-white border-slate-200'}">
+          <div class="absolute top-6 right-6 flex items-center gap-2">
+            <span class="w-3 h-3 rounded-full bg-indigo-500 shadow-[0_0_8px_rgba(99,102,241,0.8)]"></span>
+            <span class="text-[10px] font-black text-slate-400 uppercase">Динамика LOS</span>
+          </div>
+          <div class="flex-1 w-full h-full mt-4">
+            <canvas use:chartSetup></canvas>
+          </div>
         </div>
       </div>
 
     <!-- ВКЛАДКА: GPON (OLT) -->
     {:else if activeTab === 'olt'}
-      <div class="flex gap-6 h-full overflow-hidden" in:fade>
-        <div class="w-64 flex flex-col gap-2 overflow-y-auto pr-2">
-          <h3 class="text-[10px] font-black text-slate-400 uppercase mb-2 px-2">Агрегация (OLT)</h3>
+      <div class="flex gap-6 h-full overflow-hidden min-h-0" in:fade>
+        
+        <!-- Левое меню (ОЛТы) с надежным скроллом -->
+        <div class="w-64 h-full flex flex-col gap-2 overflow-y-auto pr-2 pb-4 always-visible-scroll min-h-0">
+          <h3 class="text-[10px] shrink-0 font-black text-slate-400 uppercase mb-2 px-2 tracking-widest">Список OLT</h3>
           {#each olts as olt, i}
-            <!-- Считаем Онлайн / Всего для текущего OLT -->
             {@const allOnus = olt.ports.flatMap(p => p.onus)}
-            {@const totalCount = allOnus.length}
-            {@const onlineCount = allOnus.filter(o => o.state === 'working').length}
+            {@const onlineCount = allOnus.filter(o => (o.state||'').toLowerCase() === 'working').length}
+            {@const hasMass = olt.ports.some(p => p.is_mass_outage)}
             
             <button on:click={() => {activeOltIndex = i; currentPage = 1;}}
-              class="p-4 rounded-2xl border text-left transition-all {activeOltIndex === i ? 'bg-white border-indigo-500 shadow-md ring-1 ring-indigo-500' : 'bg-white/50 border-slate-200 hover:bg-white'}">
-              <div class="font-bold text-sm text-slate-700">{olt.ip}</div>
-              <div class="flex justify-between mt-1 items-center">
-                <!-- Выводим соотношение как на втором скрине -->
-                <span class="text-[10px] font-bold text-slate-400">{onlineCount} / {totalCount} В СЕТИ</span>
-                
-                <span class="text-[9px] font-black px-1.5 py-0.5 rounded {allOnus.some(o => ['LOS', 'Down'].includes(o.state)) ? 'bg-red-100 text-red-600' : 'bg-emerald-100 text-emerald-600'}">
-                   {allOnus.some(o => ['LOS', 'Down'].includes(o.state)) ? 'АВАРИЯ' : 'НОРМА'}
-                </span>
+              class="p-4 shrink-0 rounded-2xl border text-left transition-all relative {activeOltIndex === i ? 'ring-2 ring-indigo-500 shadow-md ' + (isDark ? 'bg-slate-800 border-indigo-500' : 'bg-white border-indigo-300') : (isDark ? 'bg-slate-800/50 border-slate-800 hover:bg-slate-800' : 'bg-slate-50 border-slate-200 hover:bg-white')}">
+              {#if hasMass}
+                <div class="absolute -top-1 -right-1 w-3 h-3 bg-red-500 rounded-full animate-ping"></div>
+                <div class="absolute -top-1 -right-1 w-3 h-3 bg-red-500 rounded-full shadow-md"></div>
+              {/if}
+              <div class="font-bold text-sm {isDark ? 'text-slate-200' : 'text-slate-900'}">{olt.ip}</div>
+              <div class="flex justify-between mt-2 items-center">
+                <div class="flex-1 h-1 bg-slate-200 rounded-full overflow-hidden {isDark ? 'bg-slate-700' : ''}">
+                  <div class="bg-indigo-500 h-full" style="width: {(onlineCount/allOnus.length)*100}%"></div>
+                </div>
+                <span class="text-[9px] font-black ml-2 opacity-60">{onlineCount}/{allOnus.length}</span>
               </div>
             </button>
           {/each}
         </div>
 
-        <div class="flex-1 flex flex-col gap-4">
-          <div class="flex gap-2">
-            <input type="text" bind:value={searchQuery} placeholder="Поиск по интерфейсу или договору на {currentOlt.ip}..." 
-              class="flex-1 bg-white border border-slate-200 rounded-2xl px-6 py-3 shadow-sm outline-none focus:ring-2 ring-indigo-500/20 transition-all" />
+        <!-- Центральная часть -->
+        <div class="flex-1 flex flex-col gap-4 h-full min-w-0 min-h-0">
+          <div class="flex gap-3 shrink-0">
+            <input type="text" bind:value={searchQuery} placeholder="Поиск по интерфейсу или договору..." 
+              class="flex-1 rounded-2xl px-6 py-3 shadow-sm outline-none transition-all font-bold {isDark ? 'bg-slate-900 text-slate-200 placeholder-slate-600 border border-slate-700 focus:border-indigo-500' : 'bg-white border border-slate-200 focus:border-indigo-400 text-slate-900'}" />
             <button on:click={() => {globalLosFilter = !globalLosFilter; currentPage = 1;}} 
-              class="px-6 rounded-2xl font-bold text-sm transition-all {globalLosFilter ? 'bg-red-500 text-white shadow-lg' : 'bg-white text-slate-600 border border-slate-200 hover:bg-slate-50'}">
-              LOS
+              class="px-6 rounded-2xl font-black text-[11px] tracking-wider transition-all {globalLosFilter ? 'bg-red-500 text-white shadow-[0_4px_14px_rgba(239,68,68,0.4)]' : (isDark ? 'bg-slate-800 text-slate-400 border border-slate-700 hover:bg-slate-700' : 'bg-white text-slate-500 border border-slate-200 hover:bg-slate-50')}">
+              ТОЛЬКО LOS
             </button>
           </div>
 
-          <div class="flex-1 overflow-y-auto space-y-2 pr-2">
+          <!-- Список портов с надежным скроллом -->
+          <div class="flex-1 overflow-y-auto space-y-3 pr-2 pb-4 always-visible-scroll min-h-0">
             {#each paginatedPorts as port}
               {@const pOnus = port.onus}
-              {@const losCount = pOnus.filter(o => ['LOS', 'Down'].includes(o.state)).length}
+              {@const strictLosCount = pOnus.filter(o => ['los', 'down'].includes((o.state||'').toLowerCase())).length}
               
-              <div class="bg-white border border-slate-200 rounded-2xl shadow-sm overflow-hidden">
-                <div class="flex items-center justify-between pr-4 hover:bg-slate-50 transition-colors">
-                  <button class="flex-1 flex items-center gap-6 p-4 text-left"
-                    on:click={() => { 
-                      if(activePort === port.name) { 
-                        activePort = null; 
-                      } else { 
-                        activePort = port.name; 
-                        subFilter = globalLosFilter ? 'los' : 'all'; 
-                      } 
-                    }}>
-                    <span class="font-black text-slate-700 w-16">{port.name}</span>
-                    <div class="w-48 h-1.5 bg-slate-100 rounded-full overflow-hidden">
-                      <div class="bg-indigo-500 h-full" style="width: {((pOnus.length - losCount)/pOnus.length)*100}%"></div>
+              <div class="rounded-2xl shrink-0 shadow-sm border overflow-hidden transition-colors {port.is_mass_outage ? (isDark ? 'border-red-900 bg-red-900/10' : 'border-red-300 bg-red-50') : (isDark ? 'bg-slate-800 border-slate-700' : 'bg-white border-slate-200')}">
+                <div class="flex items-center justify-between pr-4 cursor-pointer hover:opacity-80 transition-opacity" on:click={() => { activePort = activePort === port.name ? null : port.name; subFilter = globalLosFilter ? 'los' : 'all'; }}>
+                  <div class="flex-1 flex items-center gap-6 p-4">
+                    <span class="font-black w-16 text-lg {isDark ? 'text-slate-200' : 'text-slate-800'}">{port.name}</span>
+                    {#if port.is_mass_outage}
+                      <span class="px-3 py-1 text-[10px] font-black rounded-lg bg-red-500 text-white shadow-md animate-pulse uppercase tracking-widest">Авария порта</span>
+                    {:else}
+                      <div class="w-64 h-1.5 rounded-full overflow-hidden {isDark ? 'bg-slate-900' : 'bg-slate-100'}">
+                        <div class="bg-emerald-500 h-full" style="width: {((pOnus.length - strictLosCount)/pOnus.length)*100}%"></div>
+                      </div>
+                    {/if}
+                    <div class="text-xs font-bold">
+                      <span class={strictLosCount > 0 ? 'text-red-500 drop-shadow-sm' : (isDark ? 'text-slate-500' : 'text-slate-400')}>{strictLosCount} LOS</span>
+                      <span class="text-slate-400"> / {pOnus.length}</span>
                     </div>
-                    <div class="text-[11px] font-bold text-slate-400">
-                      <span class={losCount > 0 ? 'text-red-500' : ''}>{losCount} ПРОБЛЕМ</span> / {pOnus.length}
-                    </div>
-                  </button>
-                  <button on:click|stopPropagation={() => exportPortCsv(port)} class="text-[10px] bg-slate-100 hover:bg-slate-200 px-3 py-1.5 rounded font-bold text-slate-500 transition-colors">CSV EXPORT</button>
+                  </div>
+                  <button on:click|stopPropagation={() => exportPortCsv(port)} class="text-[10px] px-3 py-1.5 rounded-md font-bold transition-colors {isDark ? 'bg-slate-700 text-slate-300 hover:bg-slate-600' : 'bg-slate-100 text-slate-500 hover:bg-slate-200'}">CSV</button>
                 </div>
 
                 {#if activePort === port.name}
-                  <div class="p-6 bg-slate-50 border-t border-slate-100" transition:slide>
-                    <div class="flex gap-4 mb-4">
+                  <div class="p-5 border-t {isDark ? 'bg-slate-900/50 border-slate-700' : 'bg-slate-50 border-slate-100'}" transition:slide>
+                    
+                    <!-- ВОЗВРАЩЕННАЯ ПАНЕЛЬ ФИЛЬТРОВ -->
+                    <div class="flex flex-wrap gap-2 mb-4 border-b pb-4 {isDark ? 'border-slate-700' : 'border-slate-200'}">
                       {#each [
                         {id: 'all', label: 'Все', count: pOnus.length},
-                        {id: 'online', label: 'Online', count: pOnus.filter(o => o.state === 'working').length},
-                        {id: 'los', label: 'LOS/Down', count: losCount},
-                        {id: 'dying', label: 'DyingGasp', count: pOnus.filter(o => o.state === 'DyingGasp').length},
-                        {id: 'offline', label: 'Offline', count: pOnus.filter(o => o.state === 'Offline').length}
+                        {id: 'online', label: 'В сети', count: pOnus.filter(o => (o.state||'').toLowerCase() === 'working').length},
+                        {id: 'los', label: 'LOS / Down', count: strictLosCount},
+                        {id: 'dying', label: 'DyingGasp', count: pOnus.filter(o => (o.state||'').toLowerCase() === 'dyinggasp').length},
+                        {id: 'offline', label: 'Offline', count: pOnus.filter(o => (o.state||'').toLowerCase() === 'offline').length}
                       ] as filter}
                         <button on:click={() => subFilter = filter.id}
-                          class="text-[10px] font-black uppercase tracking-widest pb-1 border-b-2 transition-all 
-                          {subFilter === filter.id ? 'border-indigo-500 text-indigo-600' : 'border-transparent text-slate-400 hover:text-slate-600'}">
-                          {filter.label} ({filter.count})
+                          class="text-[10px] font-black uppercase tracking-widest px-3 py-1.5 rounded-lg transition-all 
+                          {subFilter === filter.id 
+                            ? 'bg-indigo-500 text-white shadow-md' 
+                            : (isDark ? 'text-slate-400 bg-slate-800 hover:bg-slate-700' : 'text-slate-500 bg-slate-200 hover:bg-slate-300')}">
+                          {filter.label} <span class="opacity-75 ml-1">({filter.count})</span>
                         </button>
                       {/each}
                     </div>
+                    
+                    <!-- КАРТОЧКИ КЛИЕНТОВ -->
                     <div class="grid grid-cols-5 gap-3">
                       {#each pOnus.filter(o => {
-                        if (subFilter === 'online') return o.state === 'working';
-                        if (subFilter === 'los') return ['LOS', 'Down'].includes(o.state);
-                        if (subFilter === 'dying') return o.state === 'DyingGasp';
-                        if (subFilter === 'offline') return o.state === 'Offline';
+                        const s = (o.state || '').toLowerCase();
+                        if (subFilter === 'online') return s === 'working';
+                        if (subFilter === 'los') return ['los', 'down'].includes(s);
+                        if (subFilter === 'dying') return s === 'dyinggasp';
+                        if (subFilter === 'offline') return s === 'offline';
                         return true;
                       }) as onu}
-                        <div class="bg-white p-3 rounded-xl border border-slate-200 shadow-sm">
+                      
+                        <!-- Карточка БЕЗ клика и анимаций наведения -->
+                        <div class="p-3 rounded-xl border shadow-sm flex flex-col relative {isDark ? 'bg-slate-800 border-slate-700' : 'bg-white border-slate-200'}">
+                          
                           <div class="flex justify-between items-start">
-                            <span class="text-[10px] font-bold text-slate-400">{onu.id.split(':').pop()}</span>
-                            <div class="w-2 h-2 rounded-full {getDotColor(onu.state)}"></div>
+                            <span class="text-[10px] font-black {isDark ? 'text-slate-500' : 'text-slate-400'}">{onu.id.split(':').pop()}</span>
+                            <div class="w-2.5 h-2.5 rounded-full {getDotColor(onu.state)}"></div>
                           </div>
-                          <div class="text-[11px] font-black mt-1 text-slate-800 truncate" title={onu.contract}>{onu.contract || '—'}</div>
-                          <div class="text-[9px] font-bold uppercase mt-1 {getStatusColor(onu.state)}">{onu.state}</div>
+                          
+                          <div class="text-[11px] font-bold mt-2 truncate {isDark ? 'text-slate-200' : 'text-slate-800'}">{onu.contract || '—'}</div>
+                          
+                          <div class="flex justify-between items-end mt-2 pt-2 border-t {isDark ? 'border-slate-700' : 'border-slate-100'}">
+                            <div class="text-[9px] font-black uppercase tracking-wider {getStatusColor(onu.state)}">{onu.state}</div>
+                            {#if (onu.state || '').toLowerCase() !== 'working' && onu.los_time}
+                              <div class="text-[9px] font-bold text-red-500">⏱ {formatLosTime(onu.los_time)}</div>
+                            {/if}
+                          </div>
+                          
                         </div>
+                        
                       {/each}
                     </div>
+                    
                   </div>
                 {/if}
               </div>
             {/each}
           </div>
-          <div class="flex justify-center items-center gap-4 py-2">
-            <button disabled={currentPage === 1} on:click={() => currentPage--} class="w-10 h-10 rounded-xl border border-slate-200 bg-white flex items-center justify-center disabled:opacity-30">←</button>
-            <span class="text-xs font-bold text-slate-500">СТРАНИЦА {currentPage} ИЗ {totalPages || 1}</span>
-            <button disabled={currentPage >= totalPages} on:click={() => currentPage++} class="w-10 h-10 rounded-xl border border-slate-200 bg-white flex items-center justify-center disabled:opacity-30">→</button>
-          </div>
+          <!-- ПАГИНАЦИЯ -->
+          {#if totalPages > 1}
+            <div class="shrink-0 flex items-center justify-center gap-2 pt-2">
+              <button
+                on:click={() => currentPage = Math.max(1, currentPage - 1)}
+                disabled={currentPage === 1}
+                class="px-4 py-2 rounded-xl font-black text-[11px] tracking-wider transition-all disabled:opacity-30
+                  {isDark ? 'bg-slate-800 text-slate-300 border border-slate-700 hover:bg-slate-700' : 'bg-white text-slate-600 border border-slate-200 hover:bg-slate-50'}">
+                ← НАЗАД
+              </button>
+
+              <div class="flex gap-1">
+                {#each Array(totalPages) as _, i}
+                  {#if totalPages <= 7 || i === 0 || i === totalPages - 1 || Math.abs(i + 1 - currentPage) <= 1}
+                    <button
+                      on:click={() => currentPage = i + 1}
+                      class="w-9 h-9 rounded-xl font-black text-[11px] transition-all
+                        {currentPage === i + 1
+                          ? 'bg-indigo-500 text-white shadow-md'
+                          : (isDark ? 'bg-slate-800 text-slate-400 border border-slate-700 hover:bg-slate-700' : 'bg-white text-slate-500 border border-slate-200 hover:bg-slate-50')}">
+                      {i + 1}
+                    </button>
+                  {:else if Math.abs(i + 1 - currentPage) === 2}
+                    <span class="w-9 h-9 flex items-center justify-center text-slate-400 font-bold">…</span>
+                  {/if}
+                {/each}
+              </div>
+
+              <button
+                on:click={() => currentPage = Math.min(totalPages, currentPage + 1)}
+                disabled={currentPage === totalPages}
+                class="px-4 py-2 rounded-xl font-black text-[11px] tracking-wider transition-all disabled:opacity-30
+                  {isDark ? 'bg-slate-800 text-slate-300 border border-slate-700 hover:bg-slate-700' : 'bg-white text-slate-600 border border-slate-200 hover:bg-slate-50'}">
+                ВПЕРЁД →
+              </button>
+
+              <span class="text-[10px] font-bold ml-2 {isDark ? 'text-slate-500' : 'text-slate-400'}">
+                {currentPage} / {totalPages} · {filteredPorts.length} портов
+              </span>
+            </div>
+          {/if}
         </div>
       </div>
       
     <!-- ВКЛАДКА: КОММУТАТОРЫ -->
     {:else if activeTab === 'sw'}
-      <div class="flex gap-6 h-full overflow-hidden" in:fade>
-        
-        <!-- ЛЕВАЯ ПАНЕЛЬ ПАПОК -->
+      <div class="flex gap-6 h-full overflow-hidden min-h-0" in:fade>
         {#if !switchSearchQuery}
-          <div class="w-64 flex flex-col gap-2 overflow-y-auto pr-2" transition:slide={{ axis: 'x' }}>
-            <h3 class="text-[10px] font-black text-slate-400 uppercase mb-2 px-2">Папки / Локации</h3>
+          <!-- Левое меню коммутаторов с надежным скроллом -->
+          <div class="w-64 h-full flex flex-col gap-2 overflow-y-auto pr-2 pb-4 always-visible-scroll min-h-0" transition:slide={{ axis: 'x' }}>
+            <h3 class="text-[10px] shrink-0 font-black text-slate-400 uppercase mb-2 px-2 tracking-widest">Локации</h3>
             {#each switchFolders as folder, i}
-              {@const downs = folder.onus.filter(s => s.state !== 'working' && s.state !== 'Host is alive').length}
-              <button on:click={() => {activeFolderIndex = i;}}
-                class="p-4 rounded-2xl border text-left transition-all {activeFolderIndex === i ? 'bg-white border-indigo-500 shadow-md ring-1 ring-indigo-500' : 'bg-white/50 border-slate-200 hover:bg-white'}">
-                <div class="font-bold text-sm text-slate-700 truncate" title={folder.name}>{folder.name}</div>
-                <div class="flex justify-between mt-1 items-center">
-                  <span class="text-[10px] font-bold text-slate-400">{folder.onus.length} УЗЛОВ</span>
-                  {#if downs > 0}
-                    <span class="text-[9px] font-black px-1.5 py-0.5 rounded bg-red-100 text-red-600">{downs} DOWN</span>
-                  {:else}
-                    <span class="text-[9px] font-black px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-600">НОРМА</span>
-                  {/if}
+              {@const downs = folder.onus.filter(s => !['working', 'host is alive'].includes((s.state||'').toLowerCase())).length}
+              <button on:click={() => activeFolderIndex = i} class="p-4 shrink-0 rounded-2xl border text-left transition-all relative {activeFolderIndex === i ? (isDark ? 'bg-slate-800 border-indigo-500 ring-1 ring-indigo-500 shadow-md' : 'bg-white border-indigo-400 ring-1 ring-indigo-400 shadow-md') : (isDark ? 'bg-slate-800/50 border-slate-800' : 'bg-slate-50 border-slate-200')}">
+                {#if folder.is_mass_outage} <div class="absolute -top-1 -right-1 w-3 h-3 bg-red-500 rounded-full animate-ping"></div><div class="absolute -top-1 -right-1 w-3 h-3 bg-red-500 rounded-full shadow-md"></div> {/if}
+                <div class="font-bold text-sm truncate {isDark ? 'text-slate-200' : 'text-slate-800'}">{folder.name}</div>
+                <div class="flex justify-between mt-2 items-center">
+                  <span class="text-[10px] font-bold text-slate-500">{folder.onus.length} УЗЛОВ</span>
+                  {#if folder.is_mass_outage} <span class="text-[9px] font-black px-2 py-0.5 rounded bg-red-500 text-white">АВАРИЯ</span>
+                  {:else if downs > 0} <span class="text-[9px] font-black px-2 py-0.5 rounded {isDark ? 'bg-slate-900 text-red-500' : 'bg-red-50 text-red-600'}">{downs} DOWN</span>
+                  {:else} <span class="text-[9px] font-black px-2 py-0.5 rounded {isDark ? 'bg-slate-900 text-emerald-500' : 'bg-emerald-50 text-emerald-600'}">ОК</span> {/if}
                 </div>
               </button>
             {/each}
-            {#if switchFolders.length === 0}
-               <div class="text-xs text-slate-400 p-2 text-center">Папки не найдены</div>
-            {/if}
           </div>
         {/if}
 
-        <div class="flex-1 flex flex-col gap-4 overflow-hidden">
-          <!-- ПОИСК ПО КОММУТАТОРАМ -->
-          <div class="flex gap-2">
-            <input type="text" bind:value={switchSearchQuery} placeholder="Поиск по IP или адресу (ищет по ВСЕМ папкам)..." 
-              class="flex-1 bg-white border border-slate-200 rounded-2xl px-6 py-3 shadow-sm outline-none focus:ring-2 ring-indigo-500/20 transition-all" />
-          </div>
-
-          <!-- СЕТКА КОММУТАТОРОВ -->
-          <div class="grid grid-cols-4 gap-4 overflow-y-auto pr-2 pb-4 content-start">
+        <div class="flex-1 flex flex-col gap-4 h-full min-w-0 min-h-0">
+          <input type="text" bind:value={switchSearchQuery} placeholder="Поиск по IP или адресу..." 
+            class="shrink-0 rounded-2xl px-6 py-3 shadow-sm outline-none transition-all font-bold {isDark ? 'bg-slate-900 text-slate-200 placeholder-slate-600 border border-slate-700 focus:border-indigo-500' : 'bg-white border border-slate-200 focus:border-indigo-400 text-slate-900'}" />
+          
+          <!-- Сетка с коммутаторами с надежным скроллом -->
+          <div class="flex-1 grid grid-cols-4 gap-4 overflow-y-auto pr-2 pb-4 content-start always-visible-scroll min-h-0">
             {#each displayedSwitches as sw}
-              <div class="bg-white p-5 rounded-3xl border shadow-sm transition-all flex flex-col justify-between {sw.state === 'working' || sw.state === 'Host is alive' ? 'border-slate-200 hover:border-indigo-300' : 'border-red-200 bg-red-50 hover:border-red-400'}">
+              <!-- КЛИК НА СВИТЧ ДЛЯ ИСТОРИИ -->
+              <div class="p-5 rounded-3xl border shadow-sm flex flex-col justify-between cursor-pointer transition-all group {['working', 'host is alive'].includes((sw.state||'').toLowerCase()) ? (isDark ? 'bg-slate-800 border-slate-700 hover:border-indigo-500' : 'bg-white border-slate-200 hover:border-indigo-300') : (isDark ? 'border-red-900 bg-red-900/10 hover:border-red-500' : 'border-red-300 bg-red-50 hover:border-red-400')}"
+                   on:click={() => openHistory(sw.contract, sw.id, 'sw')}>
                 <div>
                   <div class="flex justify-between items-start mb-2">
-                    <div class="font-mono font-bold text-slate-800 text-sm truncate" title={sw.id}>{sw.id}</div>
-                    <div class="w-2 h-2 mt-1.5 rounded-full {getDotColor(sw.state)}"></div>
+                    <div class="font-mono font-black text-sm {isDark ? 'text-slate-200' : 'text-slate-800'}">{sw.id}</div>
+                    <div class="w-3 h-3 mt-1 rounded-full {getDotColor(sw.state)}"></div>
                   </div>
-                  <div class="text-[11px] font-bold text-slate-400 uppercase truncate" title={sw.contract}>{sw.contract || '—'}</div>
+                  <div class="text-xs font-bold leading-tight {isDark ? 'text-slate-400' : 'text-slate-500'}">{sw.contract || '—'}</div>
                 </div>
-                
-                <div class="mt-3 flex justify-between items-end gap-2">
-                  <div class="text-[10px] font-black {getStatusColor(sw.state)} uppercase">{sw.state}</div>
-                  <div class="text-[9px] font-bold text-slate-300 uppercase truncate text-right max-w-[50%]" title="Папка">
-                    {switchFolders.find(f => f.onus.includes(sw))?.name || ''}
-                  </div>
+                <div class="mt-4 pt-3 border-t flex justify-between items-end {isDark ? 'border-slate-700' : 'border-slate-100'}">
+                  <div class="text-[10px] font-black uppercase tracking-wider {getStatusColor(sw.state)}">{sw.state}</div>
+                  {#if !['working', 'host is alive'].includes((sw.state||'').toLowerCase()) && sw.los_time}
+                    <div class="text-[10px] font-black text-red-500">⏱ {formatLosTime(sw.los_time)}</div>
+                  {/if}
                 </div>
               </div>
             {/each}
-            
-            {#if displayedSwitches.length === 0}
-              <div class="col-span-4 text-center py-10 text-slate-400 font-bold text-sm">
-                Ничего не найдено
-              </div>
-            {/if}
           </div>
         </div>
       </div>
@@ -371,7 +764,41 @@
 </div>
 
 <style>
-  :global(body) { margin: 0; background-color: #f8fafc; height: 100vh; }
-  ::-webkit-scrollbar { width: 4px; }
-  ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 10px; }
+  :global(body) { 
+    margin: 0; 
+    height: 100vh; 
+    overflow: hidden; 
+  }
+
+  /* --- ИСПРАВЛЕННЫЕ ПРАВИЛА СКРОЛЛБАРОВ --- */
+  
+  :global(.always-visible-scroll) {
+    overflow-y: auto !important;   /* Показывает скроллбар ТОЛЬКО если контент не влезает */
+    overflow-x: hidden !important; /* Жестко отключает горизонтальный (нижний) скролл, убирая дергания */
+    scrollbar-width: thin !important; /* Для Firefox: делаем ползунок тоньше */
+    scrollbar-color: rgba(148, 163, 184, 0.6) transparent !important;
+  }
+  
+  :global(.always-visible-scroll::-webkit-scrollbar) {
+    width: 10px !important; /* Сделал чуть тоньше (10px вместо 14px) для эстетики */
+    /* Удалили height, так как горизонтальный скролл нам не нужен */
+  }
+  
+  :global(.always-visible-scroll::-webkit-scrollbar-track) {
+    background-color: transparent !important; /* Убираем видимую "шторку" (фон трека), когда скролл неактивен */
+    border-radius: 8px;
+  }
+  
+  :global(.always-visible-scroll::-webkit-scrollbar-thumb) {
+    background-color: rgba(148, 163, 184, 0.5) !important;
+    border-radius: 8px;
+    border: 2px solid transparent; /* Добавляет "воздух" вокруг ползунка */
+    background-clip: padding-box;
+  }
+  
+  :global(.always-visible-scroll::-webkit-scrollbar-thumb:hover),
+  :global(.always-visible-scroll::-webkit-scrollbar-thumb:active) {
+    background-color: rgba(99, 102, 241, 0.9) !important; 
+    border: 1px solid transparent; 
+  }
 </style>
