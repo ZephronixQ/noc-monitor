@@ -17,11 +17,203 @@
   let isHistoryLoading = false;
   let isModalOpen = false;
 
+  // --- НОВОЕ: УВЕДОМЛЕНИЯ И ОБНОВЛЕНИЯ ---
+  let notifications = [];
+  let showNotifications = false;
+  let unreadCount = 0;
+  
+  // Храним полное состояние
+  let knownState = { massOlt: 0, massSw: 0, downSwitches: new Map(), downOnus: new Map() };
+  let isFirstLoad = true; 
+
+  function sendPushNotification(title, body) {
+    if ("Notification" in window && Notification.permission === "granted") {
+      
+      // Считаем критичными все аварии, падения и массовые события
+      const isCritical = title.includes("АВАРИЯ") || title.includes("ПАДЕНИЕ") || title.includes("УПАЛ");
+
+      const options = {
+        body: body,
+        icon: '/favicon.ico', // Иконка поможет ОС считать пуш доверенным
+        requireInteraction: isCritical, // ОС (Windows/Mac) не скроет пуш автоматически!
+        silent: false // Обязательно со звуком
+      };
+
+      const notification = new Notification(title, options);
+
+      // Если кликнуть по пушу в Windows/Mac - браузер сам откроет эту вкладку
+      notification.onclick = function() {
+        window.focus(); // Фокусируемся на вкладке NOC
+        this.close();   // Закрываем пуш
+      };
+    }
+  }
+
+  // ОБНОВЛЕНО: Поддержка закрепления и автоудаления
+  function addNotification(type, title, body) {
+    const isMassOutage = title.includes('МАССОВАЯ');
+    const id = Date.now() + Math.random(); // Уникальный ID
+    let timeoutId = null;
+
+    // Если это массовая авария, удаляем ее автоматически через 10 минут
+    if (isMassOutage) {
+      timeoutId = setTimeout(() => {
+        removeNotification(id);
+      }, 10 * 60 * 1000); // 10 минут
+    }
+
+    const newNotif = { id, type, title, body, time: new Date(), pinned: isMassOutage, timeoutId };
+    
+    notifications = [newNotif, ...notifications].slice(0, 100);
+    unreadCount++;
+    sendPushNotification(title, body);
+  }
+
+  // НОВОЕ: Удаление конкретного уведомления
+  function removeNotification(id) {
+    notifications = notifications.filter(n => {
+      if (n.id === id && n.timeoutId) clearTimeout(n.timeoutId);
+      return n.id !== id;
+    });
+  }
+
+  // НОВОЕ: Очистка всех уведомлений (сброс таймеров)
+  function clearAllNotifications() {
+    notifications.forEach(n => { if (n.timeoutId) clearTimeout(n.timeoutId); });
+    notifications = [];
+  }
+
+  function toggleNotifications() {
+    showNotifications = !showNotifications;
+    if (showNotifications) unreadCount = 0;
+  }
+
+  // Реактивная сортировка: Закрепленные всегда сверху, остальные по времени
+  $: sortedNotifications = [...notifications].sort((a, b) => {
+    if (a.pinned && !b.pinned) return -1;
+    if (!a.pinned && b.pinned) return 1;
+    return b.time - a.time;
+  });
+
+  // Расширенная функция анализа изменений
+  function analyzeDataChanges(newData) {
+    let currentMassOlt = 0; let currentMassSw = 0;
+    let currentDownSwitches = new Map();
+    let currentDownOnus = new Map();
+
+    // 1. Собираем свежие данные
+    newData.forEach(d => {
+      if (d.isSwitch) {
+        d.ports.forEach(folder => {
+          if (folder.is_mass_outage) currentMassSw++;
+          folder.onus.forEach(sw => {
+            const state = (sw.state || '').toLowerCase();
+            if (!['working', 'host is alive'].includes(state)) {
+              currentDownSwitches.set(sw.id, sw.contract || '—');
+            }
+          });
+        });
+      } else {
+        d.ports.forEach(port => {
+          if (port.is_mass_outage) currentMassOlt++;
+          port.onus.forEach(onu => {
+            const state = (onu.state || '').toLowerCase();
+            // Собираем ТОЛЬКО los и down для уведомлений
+            if (['los', 'down'].includes(state)) {
+              currentDownOnus.set(`${d.ip}:${onu.id}`, onu.contract || '—');
+            }
+          });
+        });
+      }
+    });
+
+    // 2. Сравниваем с предыдущим состоянием (ТОЛЬКО если это не первая загрузка)
+    if (!isFirstLoad) {
+      
+      // -- Массовые очаги OLT/Папок (по флагам бекенда) --
+      if (currentMassOlt > knownState.massOlt) {
+        addNotification('critical', 'МАССОВАЯ АВАРИЯ OLT', `Зафиксировано ${currentMassOlt} очагов GPON.`);
+      }
+      if (currentMassSw > knownState.massSw) {
+        addNotification('critical', 'МАССОВАЯ АВАРИЯ SW', `Зафиксировано ${currentMassSw} локаций коммутаторов.`);
+      }
+
+      // === АНТИ-СПАМ ЛОГИКА ===
+      let newDownSw = []; let upSw = [];
+      let newDownOnu = []; let upOnu = [];
+
+      // Собираем списки изменений
+      currentDownSwitches.forEach((contract, id) => { if (!knownState.downSwitches.has(id)) newDownSw.push(id); });
+      knownState.downSwitches.forEach((contract, id) => { if (!currentDownSwitches.has(id)) upSw.push(id); });
+      
+      currentDownOnus.forEach((contract, id) => { if (!knownState.downOnus.has(id)) newDownOnu.push({id, contract}); });
+      knownState.downOnus.forEach((contract, id) => { if (!currentDownOnus.has(id)) upOnu.push({id, contract}); });
+
+      // ПОРОГИ СРАБАТЫВАНИЯ (Свыше какого количества схлопывать в одно уведомление)
+      const SW_LIMIT = 5;  
+      const ONU_LIMIT = 10; 
+
+      // -- Обработка коммутаторов --
+      if (newDownSw.length > SW_LIMIT) {
+        addNotification('critical', `МАССОВОЕ ПАДЕНИЕ SW`, `Сразу ${newDownSw.length} коммутаторов недоступны.\nВозможно потеря SNMP пакетов или падение магистрали.`);
+      } else {
+        newDownSw.forEach(id => addNotification('critical', `УПАЛ КОММУТАТОР`, `🔌 IP-адрес: ${id}`));
+      }
+
+      if (upSw.length > SW_LIMIT) {
+        addNotification('success', `МАССОВОЕ ВОССТАНОВЛЕНИЕ SW`, `Сразу ${upSw.length} коммутаторов вернулись в сеть.`);
+      } else {
+        upSw.forEach(id => addNotification('success', `КОММУТАТОР В СЕТИ`, `🔌 IP-адрес: ${id}`));
+      }
+
+      // -- Обработка GPON клиентов --
+      if (newDownOnu.length > ONU_LIMIT) {
+        addNotification('warning', `МАССОВЫЙ LOS (GPON)`, `Сразу ${newDownOnu.length} клиентов отвалились (LOS/Down).`);
+      } else {
+        newDownOnu.forEach(onu => {
+          const p = onu.id.split(':');
+          const route = p.length === 3 ? `[${p[0]}] ➔ [${p[1]}] ➔ ONU ${p[2]}` : onu.id;
+          addNotification('warning', `АВАРИЯ GPON (LOS)`, `👤 Договор: ${onu.contract}\n🔌 Маршрут: ${route}`);
+        });
+      }
+
+      if (upOnu.length > ONU_LIMIT) {
+        addNotification('success', `МАССОВОЕ ВОССТАНОВЛЕНИЕ GPON`, `Сразу ${upOnu.length} клиентов вернулись в сеть.`);
+      } else {
+        upOnu.forEach(onu => {
+          const p = onu.id.split(':');
+          const route = p.length === 3 ? `[${p[0]}] ➔ [${p[1]}] ➔ ONU ${p[2]}` : onu.id;
+          addNotification('success', `GPON КЛИЕНТ В СЕТИ`, `👤 Договор: ${onu.contract}\n🔌 Маршрут: ${route}`);
+        });
+      }
+    }
+
+    // 3. Сохраняем текущее состояние как эталон
+    knownState.massOlt = currentMassOlt;
+    knownState.massSw = currentMassSw;
+    knownState.downSwitches = currentDownSwitches;
+    knownState.downOnus = currentDownOnus;
+    isFirstLoad = false;
+  }
+
+  async function forceUpdate() {
+    if (isUpdating) return;
+    try {
+      isUpdating = true;
+      await fetch(`${BACKEND_URL}/api/update/force`, { method: 'POST' });
+    } catch(e) { console.error("Ошибка принудительного обновления:", e); }
+  }
+  // --- КОНЕЦ НОВОГО ---
+
   onMount(() => { 
     host = window.location.hostname; 
     const storedTheme = localStorage.getItem('noc-theme');
     if (storedTheme) isDark = storedTheme === 'dark';
     else isDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+
+    if ("Notification" in window && Notification.permission !== "granted" && Notification.permission !== "denied") {
+      Notification.requestPermission();
+    }
   });
 
   function toggleTheme() {
@@ -40,6 +232,7 @@
   let switchSearchQuery = ''; 
   
   let globalLosFilter = false;
+  let globalSwLosFilter = false;
   let activePort = null;
   let subFilter = 'all'; 
 
@@ -62,12 +255,11 @@
     } catch(e) { console.error("Ошибка загрузки отчета:", e); }
   }
 
-let activeHistoryRequest = null; // Храним контроллер текущего запроса
+  let activeHistoryRequest = null;
   async function openHistory(contract, id, type = 'sw') {
     if (type !== 'sw') return; 
     if (!contract || contract === '—') return;
     
-    // Если уже идет загрузка, игнорируем новые клики
     if (isHistoryLoading) return;
     
     selectedEntity = { contract, id, type };
@@ -76,15 +268,15 @@ let activeHistoryRequest = null; // Храним контроллер текущ
     
     try {
       const controller = new AbortController();
-      activeHistoryRequest = controller; // Запоминаем для отмены
+      activeHistoryRequest = controller; 
       
       const timeoutId = setTimeout(() => {
-        controller.abort(); // Отмена если сервер молчит > 5 сек
+        controller.abort();
       }, 5000); 
 
       const res = await fetch(`${BACKEND_URL}/api/history/${encodeURIComponent(id)}?days=30`, {
         signal: controller.signal,
-        cache: 'no-store' // Запрещаем браузеру кэшировать сломанные ответы
+        cache: 'no-store' 
       });
       
       clearTimeout(timeoutId);
@@ -104,7 +296,6 @@ let activeHistoryRequest = null; // Храним контроллер текущ
   }
 
   function closeHistory() {
-    // Если юзер нажал "крестик" ДО того как загрузилось, принудительно обрываем запрос к серверу!
     if (activeHistoryRequest) {
       activeHistoryRequest.abort();
       activeHistoryRequest = null;
@@ -114,11 +305,10 @@ let activeHistoryRequest = null; // Храним контроллер текущ
     setTimeout(() => { 
       selectedEntity = null; 
       entityHistory = []; 
-      isHistoryLoading = false; // Очищаем статус загрузки
+      isHistoryLoading = false; 
     }, 300);
   }
 
-  // Функция экспорта в CSV
   function exportPortCsv(port) {
     if (!port || !port.onus) return;
     let csvContent = "data:text/csv;charset=utf-8,";
@@ -140,7 +330,14 @@ let activeHistoryRequest = null; // Храним контроллер текущ
 
   // --- ДАННЫЕ СЕТИ ---
   $: olts = data.filter(d => !d.isSwitch);
-  $: currentOlt = olts[activeOltIndex] || { ports: [] };
+
+  $: filteredOlts = olts.filter(olt => {
+    if (!globalLosFilter) return true;
+    return olt.ports.some(p => p.onus.some(o => ['los', 'down'].includes((o.state||'').toLowerCase())));
+  });
+  
+  $: if (activeOltIndex >= filteredOlts.length) activeOltIndex = 0;
+  $: currentOlt = filteredOlts[activeOltIndex] || { ports: [] };
 
   $: filteredPorts = (currentOlt.ports || [])
     .filter(port => {
@@ -163,12 +360,19 @@ let activeHistoryRequest = null; // Храним контроллер текущ
 
   $: switchDataNode = data.find(d => d.isSwitch) || { ports: [] };
   $: switchFolders = switchDataNode.ports || [];
+
+  $: filteredSwitchFolders = switchFolders.filter(folder => {
+    if (!globalSwLosFilter) return true;
+    return folder.onus.some(sw => !['working', 'host is alive'].includes((sw.state||'').toLowerCase()));
+  });
+
+  $: if (activeFolderIndex >= filteredSwitchFolders.length) activeFolderIndex = 0;
+  $: currentSwitchFolder = filteredSwitchFolders[activeFolderIndex] || { onus: [] };
   $: allSwitchesFlat = switchFolders.flatMap(folder => folder.onus || []);
-  $: currentSwitchFolder = switchFolders[activeFolderIndex] || { onus: [] };
 
   $: displayedSwitches = switchSearchQuery 
     ? allSwitchesFlat.filter(sw => sw.id.toLowerCase().includes(switchSearchQuery.toLowerCase()) || (sw.contract || '').toLowerCase().includes(switchSearchQuery.toLowerCase()))
-    : currentSwitchFolder.onus || [];
+    : (currentSwitchFolder.onus || []).filter(sw => !globalSwLosFilter || !['working', 'host is alive'].includes((sw.state||'').toLowerCase()));
 
   $: totalStats = {
     onus: olts.reduce((acc, olt) => acc + olt.ports.flatMap(p => p.onus).length, 0),
@@ -189,7 +393,6 @@ let activeHistoryRequest = null; // Храним контроллер текущ
 
   $: if (chartInstance) updateChartTheme(isDark);
 
-  // Умная инициализация графика (ждет загрузки Chart.js из интернета)
   function chartSetup(node) {
     chartCanvas = node;
     const checkChart = setInterval(() => {
@@ -242,7 +445,6 @@ let activeHistoryRequest = null; // Храним контроллер текущ
     updateChartTheme(isDark);
   }
 
-  // Просто обновляет визуальную часть, не добавляя новые точки (используется при загрузке страницы)
   function redrawChart() {
     if (chartInstance) {
       chartInstance.data.labels = historyLabels;
@@ -251,12 +453,10 @@ let activeHistoryRequest = null; // Храним контроллер текущ
     }
   }
 
-  // Добавляет новую точку в массив, сохраняет и рисует
   async function updateChartData() {
     await tick(); 
     const now = new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
     
-    // Защита от дублирования точек при частых обновлениях (заменяет последнюю, если время совпадает)
     if (historyLabels.length > 0 && historyLabels[historyLabels.length - 1] === now) {
       historyData[historyData.length - 1] = totalStats.los;
     } else {
@@ -314,9 +514,11 @@ let ws;
     ws.onmessage = async (e) => {
       const msg = JSON.parse(e.data);
       if (msg.type === "update") {
+        analyzeDataChanges(msg.data); 
         data = msg.data; nextUpdateTs = msg.next_update; isUpdating = msg.is_updating;
-        // Добавляем новую точку только при реальном обновлении данных по WS
         if (!msg.is_sw_only) await updateChartData();
+      } else if (msg.type === "status") { 
+        isUpdating = msg.is_updating;
       }
     };
     ws.onclose = () => {
@@ -327,7 +529,6 @@ let ws;
   }
 
   onMount(async () => {
-    // 1. Восстанавливаем график из памяти
     try {
       const savedLabels = localStorage.getItem('noc_chart_labels');
       const savedData = localStorage.getItem('noc_chart_data');
@@ -337,17 +538,16 @@ let ws;
       }
     } catch(e) { console.error("Ошибка чтения истории графика:", e); }
 
-    // 2. Первичная загрузка данных (без добавления новой точки на график)
     try {
       const res = await fetch(`${BACKEND_URL}/api/data`);
       const json = await res.json();
       data = json.data; nextUpdateTs = json.next_update; isUpdating = json.is_updating;
       await tick();
-      redrawChart(); // Просто перерисовываем то, что загрузили из памяти
+      redrawChart();
     } catch(e) {}
 
     fetchDailyStats();
-    setInterval(fetchDailyStats, 300000); // Обновлять стату раз в 5 минут
+    setInterval(fetchDailyStats, 300000); 
     connectWebSocket();
     setInterval(updateTimer, 1000);
   });
@@ -411,7 +611,7 @@ let ws;
   </div>
 {/if}
 
-<div class="h-screen w-full overflow-hidden font-sans flex flex-col transition-colors duration-200 {isDark ? 'bg-[#0b1120] text-slate-200' : 'bg-slate-50 text-slate-900'}">
+<div class="h-screen w-full overflow-hidden font-sans flex flex-col transition-colors duration-200 {isDark ? 'bg-[#0b1120] text-slate-200' : 'bg-slate-50 text-slate-900'} relative">
   <header class="h-14 shrink-0 flex items-center justify-between px-6 sticky top-0 z-40 shadow-sm backdrop-blur-md border-b {isDark ? 'bg-slate-900/80 border-slate-800' : 'bg-white/80 border-slate-200'}">
     <div class="flex items-center gap-8">
       <div class="flex items-center gap-2">
@@ -425,7 +625,60 @@ let ws;
       </nav>
     </div>
     
-    <div class="flex items-center gap-4">
+    <div class="flex items-center gap-4 relative">
+      
+      <button on:click={toggleNotifications} class="relative w-8 h-8 rounded-full flex items-center justify-center transition-colors {isDark ? 'bg-slate-800 text-slate-400 hover:bg-slate-700 hover:text-white' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}">
+        <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 20 20"><path d="M10 2a6 6 0 00-6 6v3.586l-.707.707A1 1 0 004 14h12a1 1 0 00.707-1.707L16 11.586V8a6 6 0 00-6-6zM10 18a3 3 0 01-3-3h6a3 3 0 01-3 3z"/></svg>
+        {#if unreadCount > 0}
+          <span class="absolute -top-1 -right-1 flex h-4 w-4 items-center justify-center rounded-full bg-red-500 text-[9px] font-black text-white shadow-md animate-bounce">{unreadCount}</span>
+        {/if}
+      </button>
+
+      {#if showNotifications}
+        <div class="absolute top-12 right-12 w-80 rounded-2xl shadow-2xl border overflow-hidden flex flex-col z-50 {isDark ? 'bg-slate-900 border-slate-700' : 'bg-white border-slate-200'}" transition:slide={{duration: 200}}>
+          <div class="px-4 py-3 border-b flex justify-between items-center {isDark ? 'border-slate-800 bg-slate-800/50' : 'border-slate-100 bg-slate-50'}">
+            <span class="text-xs font-black tracking-wider uppercase {isDark ? 'text-slate-300' : 'text-slate-600'}">Уведомления</span>
+            <button on:click={clearAllNotifications} class="text-[10px] font-bold text-indigo-500 hover:underline">Очистить</button>
+          </div>
+          <div class="max-h-80 overflow-y-auto always-visible-scroll p-2">
+            {#if sortedNotifications.length === 0}
+              <div class="text-center py-8 text-xs font-bold opacity-50 {isDark ? 'text-slate-400' : 'text-slate-500'}">Нет новых событий</div>
+            {:else}
+              {#each sortedNotifications as notif (notif.id)}
+                <div class="relative p-3 mb-2 last:mb-0 rounded-xl text-left border transition-all
+                  {notif.pinned ? 'shadow-md border-l-4 border-l-red-500 ' : ''}
+                  {notif.type === 'critical' ? (isDark ? 'bg-red-900/20 border-red-900/50' : 'bg-red-50 border-red-100') : 
+                   notif.type === 'success' ? (isDark ? 'bg-emerald-900/20 border-emerald-900/50' : 'bg-emerald-50 border-emerald-100') :
+                   notif.type === 'warning' ? (isDark ? 'bg-orange-900/20 border-orange-900/50' : 'bg-orange-50 border-orange-100') :
+                   (isDark ? 'bg-slate-800 border-slate-700' : 'bg-white border-slate-100')}">
+                  
+                  <div class="flex justify-between items-start mb-1 pr-5">
+                    <span class="flex items-center gap-1 text-[10px] font-black uppercase 
+                      {notif.type === 'critical' ? 'text-red-500' : 
+                       notif.type === 'success' ? 'text-emerald-500' : 
+                       notif.type === 'warning' ? 'text-orange-500' : 'text-slate-500'}">
+                      {#if notif.pinned} <span title="Закреплено на 10 мин" class="animate-pulse">📌</span> {/if}
+                      {notif.title}
+                    </span>
+                    <span class="text-[9px] font-bold opacity-50 {isDark ? 'text-slate-400' : 'text-slate-500'}">
+                      {notif.time.toLocaleTimeString('ru-RU')}
+                    </span>
+                  </div>
+                  
+                  <!-- НОВОЕ: Перенос строк и улучшенный интерлиньяж для маршрута -->
+                  <p class="text-xs font-medium leading-relaxed whitespace-pre-line {isDark ? 'text-slate-300' : 'text-slate-600'}">{notif.body}</p>
+                  
+                  <!-- Крестик закрытия -->
+                  <button on:click|stopPropagation={() => removeNotification(notif.id)} class="absolute top-2.5 right-2 p-1 rounded-full opacity-40 hover:opacity-100 transition-opacity {isDark ? 'hover:bg-slate-700 text-slate-300' : 'hover:bg-slate-200 text-slate-600'}">
+                    <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M6 18L18 6M6 6l12 12"/></svg>
+                  </button>
+                </div>
+              {/each}
+            {/if}
+          </div>
+        </div>
+      {/if}
+
       <button on:click={toggleTheme} class="w-8 h-8 rounded-full flex items-center justify-center transition-colors {isDark ? 'bg-slate-800 text-yellow-400 hover:bg-slate-700' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}">
         {#if isDark} ☀️ {:else} 🌙 {/if}
       </button>
@@ -441,12 +694,19 @@ let ws;
           </div>
           <span class="text-[10px] font-black tracking-wider {wsConnected ? 'text-emerald-500' : 'text-red-500'}">{wsConnected ? 'ONLINE' : 'OFFLINE'}</span>
         </div>
-        <div class="font-mono text-[10px] font-bold {isDark ? 'text-slate-400' : 'text-slate-500'}">ОПРОС: <span class="text-indigo-500">{timeToNextUpdate}</span></div>
+        
+        <div class="flex items-center bg-slate-100 rounded-lg pr-1 {isDark ? 'bg-slate-800' : ''}">
+          <div class="px-2 py-1.5 font-mono text-[10px] font-bold {isDark ? 'text-slate-400' : 'text-slate-500'}">ОПРОС: <span class="text-indigo-500">{timeToNextUpdate}</span></div>
+          <button on:click={forceUpdate} title="Принудительный опрос" class="w-6 h-6 rounded-md flex items-center justify-center transition-all {isUpdating ? 'opacity-50 cursor-not-allowed' : 'hover:bg-indigo-500 hover:text-white'} {isDark ? 'text-slate-400' : 'text-slate-500'}">
+            <svg class="w-3 h-3 {isUpdating ? 'animate-spin' : ''}" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+          </button>
+        </div>
+
       </div>
     </div>
   </header>
 
-  <main class="p-6 flex-1 overflow-hidden flex flex-col min-h-0">
+  <main class="p-6 flex-1 overflow-hidden flex flex-col min-h-0" on:click={() => showNotifications = false}>
     
     <!-- ВКЛАДКА: ОБЗОР -->
     {#if activeTab === 'dash'}
@@ -546,9 +806,15 @@ let ws;
         <!-- Левое меню (ОЛТы) с надежным скроллом -->
         <div class="w-64 h-full flex flex-col gap-2 overflow-y-auto pr-2 pb-4 always-visible-scroll min-h-0">
           <h3 class="text-[10px] shrink-0 font-black text-slate-400 uppercase mb-2 px-2 tracking-widest">Список OLT</h3>
-          {#each olts as olt, i}
+          
+          {#if filteredOlts.length === 0}
+            <div class="text-xs font-bold text-slate-400 text-center mt-10">Все OLT работают в норме</div>
+          {/if}
+
+          {#each filteredOlts as olt, i}
             {@const allOnus = olt.ports.flatMap(p => p.onus)}
             {@const onlineCount = allOnus.filter(o => (o.state||'').toLowerCase() === 'working').length}
+            {@const losCount = allOnus.filter(o => ['los', 'down'].includes((o.state||'').toLowerCase())).length}
             {@const hasMass = olt.ports.some(p => p.is_mass_outage)}
             
             <button on:click={() => {activeOltIndex = i; currentPage = 1;}}
@@ -557,12 +823,22 @@ let ws;
                 <div class="absolute -top-1 -right-1 w-3 h-3 bg-red-500 rounded-full animate-ping"></div>
                 <div class="absolute -top-1 -right-1 w-3 h-3 bg-red-500 rounded-full shadow-md"></div>
               {/if}
-              <div class="font-bold text-sm {isDark ? 'text-slate-200' : 'text-slate-900'}">{olt.ip}</div>
-              <div class="flex justify-between mt-2 items-center">
+              <!-- Верхняя строка: IP и количество LOS (справа) -->
+              <div class="flex justify-between items-start">
+                <div class="font-bold text-sm {isDark ? 'text-slate-200' : 'text-slate-900'}">{olt.ip}</div>
+                {#if losCount > 0}
+                  <span class="text-[9px] font-black text-red-500 bg-red-500/10 px-1.5 py-0.5 rounded">{losCount} LOS</span>
+                {/if}
+              </div>
+              
+              <!-- Нижняя строка: Прогресс-бар и общий счетчик -->
+              <div class="flex justify-between mt-2.5 items-center">
                 <div class="flex-1 h-1 bg-slate-200 rounded-full overflow-hidden {isDark ? 'bg-slate-700' : ''}">
                   <div class="bg-indigo-500 h-full" style="width: {(onlineCount/allOnus.length)*100}%"></div>
                 </div>
-                <span class="text-[9px] font-black ml-2 opacity-60">{onlineCount}/{allOnus.length}</span>
+                <span class="text-[9px] font-black opacity-60 whitespace-nowrap ml-3">
+                  {onlineCount}/{allOnus.length}
+                </span>
               </div>
             </button>
           {/each}
@@ -607,7 +883,6 @@ let ws;
                 {#if activePort === port.name}
                   <div class="p-5 border-t {isDark ? 'bg-slate-900/50 border-slate-700' : 'bg-slate-50 border-slate-100'}" transition:slide>
                     
-                    <!-- ВОЗВРАЩЕННАЯ ПАНЕЛЬ ФИЛЬТРОВ -->
                     <div class="flex flex-wrap gap-2 mb-4 border-b pb-4 {isDark ? 'border-slate-700' : 'border-slate-200'}">
                       {#each [
                         {id: 'all', label: 'Все', count: pOnus.length},
@@ -626,7 +901,6 @@ let ws;
                       {/each}
                     </div>
                     
-                    <!-- КАРТОЧКИ КЛИЕНТОВ -->
                     <div class="grid grid-cols-5 gap-3">
                       {#each pOnus.filter(o => {
                         const s = (o.state || '').toLowerCase();
@@ -637,7 +911,6 @@ let ws;
                         return true;
                       }) as onu}
                       
-                        <!-- Карточка БЕЗ клика и анимаций наведения -->
                         <div class="p-3 rounded-xl border shadow-sm flex flex-col relative {isDark ? 'bg-slate-800 border-slate-700' : 'bg-white border-slate-200'}">
                           
                           <div class="flex justify-between items-start">
@@ -715,7 +988,12 @@ let ws;
           <!-- Левое меню коммутаторов с надежным скроллом -->
           <div class="w-64 h-full flex flex-col gap-2 overflow-y-auto pr-2 pb-4 always-visible-scroll min-h-0" transition:slide={{ axis: 'x' }}>
             <h3 class="text-[10px] shrink-0 font-black text-slate-400 uppercase mb-2 px-2 tracking-widest">Локации</h3>
-            {#each switchFolders as folder, i}
+            
+            {#if filteredSwitchFolders.length === 0}
+              <div class="text-xs font-bold text-slate-400 text-center mt-10">Все коммутаторы в сети</div>
+            {/if}
+
+            {#each filteredSwitchFolders as folder, i}
               {@const downs = folder.onus.filter(s => !['working', 'host is alive'].includes((s.state||'').toLowerCase())).length}
               <button on:click={() => activeFolderIndex = i} class="p-4 shrink-0 rounded-2xl border text-left transition-all relative {activeFolderIndex === i ? (isDark ? 'bg-slate-800 border-indigo-500 ring-1 ring-indigo-500 shadow-md' : 'bg-white border-indigo-400 ring-1 ring-indigo-400 shadow-md') : (isDark ? 'bg-slate-800/50 border-slate-800' : 'bg-slate-50 border-slate-200')}">
                 {#if folder.is_mass_outage} <div class="absolute -top-1 -right-1 w-3 h-3 bg-red-500 rounded-full animate-ping"></div><div class="absolute -top-1 -right-1 w-3 h-3 bg-red-500 rounded-full shadow-md"></div> {/if}
@@ -732,13 +1010,19 @@ let ws;
         {/if}
 
         <div class="flex-1 flex flex-col gap-4 h-full min-w-0 min-h-0">
-          <input type="text" bind:value={switchSearchQuery} placeholder="Поиск по IP или адресу..." 
-            class="shrink-0 rounded-2xl px-6 py-3 shadow-sm outline-none transition-all font-bold {isDark ? 'bg-slate-900 text-slate-200 placeholder-slate-600 border border-slate-700 focus:border-indigo-500' : 'bg-white border border-slate-200 focus:border-indigo-400 text-slate-900'}" />
+          
+          <div class="flex gap-3 shrink-0">
+            <input type="text" bind:value={switchSearchQuery} placeholder="Поиск по IP или адресу..." 
+              class="flex-1 rounded-2xl px-6 py-3 shadow-sm outline-none transition-all font-bold {isDark ? 'bg-slate-900 text-slate-200 placeholder-slate-600 border border-slate-700 focus:border-indigo-500' : 'bg-white border border-slate-200 focus:border-indigo-400 text-slate-900'}" />
+            <button on:click={() => globalSwLosFilter = !globalSwLosFilter} 
+              class="px-6 rounded-2xl font-black text-[11px] tracking-wider transition-all {globalSwLosFilter ? 'bg-red-500 text-white shadow-[0_4px_14px_rgba(239,68,68,0.4)]' : (isDark ? 'bg-slate-800 text-slate-400 border border-slate-700 hover:bg-slate-700' : 'bg-white text-slate-500 border border-slate-200 hover:bg-slate-50')}">
+              ТОЛЬКО LOS
+            </button>
+          </div>
           
           <!-- Сетка с коммутаторами с надежным скроллом -->
           <div class="flex-1 grid grid-cols-4 gap-4 overflow-y-auto pr-2 pb-4 content-start always-visible-scroll min-h-0">
             {#each displayedSwitches as sw}
-              <!-- КЛИК НА СВИТЧ ДЛЯ ИСТОРИИ -->
               <div class="p-5 rounded-3xl border shadow-sm flex flex-col justify-between cursor-pointer transition-all group {['working', 'host is alive'].includes((sw.state||'').toLowerCase()) ? (isDark ? 'bg-slate-800 border-slate-700 hover:border-indigo-500' : 'bg-white border-slate-200 hover:border-indigo-300') : (isDark ? 'border-red-900 bg-red-900/10 hover:border-red-500' : 'border-red-300 bg-red-50 hover:border-red-400')}"
                    on:click={() => openHistory(sw.contract, sw.id, 'sw')}>
                 <div>
@@ -770,29 +1054,26 @@ let ws;
     overflow: hidden; 
   }
 
-  /* --- ИСПРАВЛЕННЫЕ ПРАВИЛА СКРОЛЛБАРОВ --- */
-  
   :global(.always-visible-scroll) {
-    overflow-y: auto !important;   /* Показывает скроллбар ТОЛЬКО если контент не влезает */
-    overflow-x: hidden !important; /* Жестко отключает горизонтальный (нижний) скролл, убирая дергания */
-    scrollbar-width: thin !important; /* Для Firefox: делаем ползунок тоньше */
+    overflow-y: auto !important;
+    overflow-x: hidden !important; 
+    scrollbar-width: thin !important; 
     scrollbar-color: rgba(148, 163, 184, 0.6) transparent !important;
   }
   
   :global(.always-visible-scroll::-webkit-scrollbar) {
-    width: 10px !important; /* Сделал чуть тоньше (10px вместо 14px) для эстетики */
-    /* Удалили height, так как горизонтальный скролл нам не нужен */
+    width: 10px !important;
   }
   
   :global(.always-visible-scroll::-webkit-scrollbar-track) {
-    background-color: transparent !important; /* Убираем видимую "шторку" (фон трека), когда скролл неактивен */
+    background-color: transparent !important; 
     border-radius: 8px;
   }
   
   :global(.always-visible-scroll::-webkit-scrollbar-thumb) {
     background-color: rgba(148, 163, 184, 0.5) !important;
     border-radius: 8px;
-    border: 2px solid transparent; /* Добавляет "воздух" вокруг ползунка */
+    border: 2px solid transparent; 
     background-clip: padding-box;
   }
   

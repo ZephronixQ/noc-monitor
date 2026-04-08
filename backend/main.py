@@ -26,6 +26,8 @@ INTERNAL_STATE = {
 
 GLOBAL_STATE = {"data": [], "next_update": 0, "is_updating": False}
 
+# Событие для принудительного обновления OLT
+force_update_event = asyncio.Event()
 
 def refresh_global_state():
     switches_node = {
@@ -210,7 +212,13 @@ async def poll_olt_loop():
             "is_updating": False,
             "is_sw_only": False,
         })
-        await asyncio.sleep(POLL_INTERVAL_SEC)
+        
+        # Ждем POLL_INTERVAL_SEC или пока не дернут force_update_event
+        try:
+            await asyncio.wait_for(force_update_event.wait(), timeout=POLL_INTERVAL_SEC)
+            force_update_event.clear() # Сбрасываем флаг, если он сработал
+        except asyncio.TimeoutError:
+            pass # Истек таймаут, обновляем по графику
 
 
 @asynccontextmanager
@@ -240,14 +248,17 @@ async def get_daily_stats():
 
 @app.get("/api/history/{target_id:path}")
 async def get_contract_history(target_id: str, days: int = 30):
-    print(f"📥 Запрос истории с фронтенда для: {target_id}")
     try:
         history = get_history(target_id, days)
-        print(f"✅ Отдано записей: {len(history)}")
         return {"target_id": target_id, "days": days, "incidents": history, "total": len(history)}
     except Exception as e:
-        print(f"❌ Ошибка: {e}")
         return {"target_id": target_id, "days": days, "incidents": [], "error": str(e)}
+
+# ЭНДПОИНТ ПРИНУДИТЕЛЬНОГО ОБНОВЛЕНИЯ
+@app.post("/api/update/force")
+async def trigger_force_update():
+    force_update_event.set()
+    return {"status": "ok", "message": "Update triggered"}
 
 
 @app.websocket("/ws")
