@@ -6,7 +6,7 @@
   import { onMount, tick } from 'svelte';
   import { slide, fade, scale } from 'svelte/transition';
   
-  // let host = "localhost"; 
+  let host = "localhost"; 
   let isDark = false;
   let wsConnected = false;
 
@@ -206,7 +206,7 @@
   }
 
   onMount(() => { 
-    // host = window.location.hostname; 
+    host = window.location.hostname; 
     const storedTheme = localStorage.getItem('noc-theme');
     if (storedTheme) isDark = storedTheme === 'dark';
     else isDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
@@ -221,8 +221,8 @@
     localStorage.setItem('noc-theme', isDark ? 'dark' : 'light');
   }
 
-  $: BACKEND_URL = `http://${host}:8000`;
-  $: WS_URL = `ws://${host}:8000/ws`;
+  $: BACKEND_URL = `${window.location.protocol}//${window.location.host}`;
+  $: WS_URL = `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/ws`;
 
   let activeTab = 'dash'; 
   let activeOltIndex = 0;
