@@ -17,59 +17,48 @@
   let isHistoryLoading = false;
   let isModalOpen = false;
 
-  // --- НОВОЕ: УВЕДОМЛЕНИЯ И ОБНОВЛЕНИЯ ---
+  // --- УВЕДОМЛЕНИЯ И ОБНОВЛЕНИЯ ---
   let notifications = [];
   let showNotifications = false;
   let unreadCount = 0;
   
-  // Храним полное состояние
   let knownState = { massOlt: 0, massSw: 0, downSwitches: new Map(), downOnus: new Map() };
   let isFirstLoad = true; 
 
   function sendPushNotification(title, body) {
     if ("Notification" in window && Notification.permission === "granted") {
-      
-      // Считаем критичными все аварии, падения и массовые события
       const isCritical = title.includes("АВАРИЯ") || title.includes("ПАДЕНИЕ") || title.includes("УПАЛ");
-
       const options = {
         body: body,
-        icon: '/favicon.ico', // Иконка поможет ОС считать пуш доверенным
-        requireInteraction: isCritical, // ОС (Windows/Mac) не скроет пуш автоматически!
-        silent: false // Обязательно со звуком
+        icon: '/favicon.ico',
+        requireInteraction: isCritical,
+        silent: false
       };
-
       const notification = new Notification(title, options);
-
-      // Если кликнуть по пушу в Windows/Mac - браузер сам откроет эту вкладку
       notification.onclick = function() {
-        window.focus(); // Фокусируемся на вкладке NOC
-        this.close();   // Закрываем пуш
+        window.focus(); 
+        this.close();   
       };
     }
   }
 
-  // ОБНОВЛЕНО: Поддержка закрепления и автоудаления
   function addNotification(type, title, body) {
     const isMassOutage = title.includes('МАССОВАЯ');
-    const id = Date.now() + Math.random(); // Уникальный ID
+    const id = Date.now() + Math.random(); 
     let timeoutId = null;
 
-    // Если это массовая авария, удаляем ее автоматически через 10 минут
     if (isMassOutage) {
       timeoutId = setTimeout(() => {
         removeNotification(id);
-      }, 10 * 60 * 1000); // 10 минут
+      }, 10 * 60 * 1000);
     }
 
     const newNotif = { id, type, title, body, time: new Date(), pinned: isMassOutage, timeoutId };
-    
     notifications = [newNotif, ...notifications].slice(0, 100);
     unreadCount++;
     sendPushNotification(title, body);
   }
 
-  // НОВОЕ: Удаление конкретного уведомления
   function removeNotification(id) {
     notifications = notifications.filter(n => {
       if (n.id === id && n.timeoutId) clearTimeout(n.timeoutId);
@@ -77,7 +66,6 @@
     });
   }
 
-  // НОВОЕ: Очистка всех уведомлений (сброс таймеров)
   function clearAllNotifications() {
     notifications.forEach(n => { if (n.timeoutId) clearTimeout(n.timeoutId); });
     notifications = [];
@@ -88,26 +76,23 @@
     if (showNotifications) unreadCount = 0;
   }
 
-  // Реактивная сортировка: Закрепленные всегда сверху, остальные по времени
   $: sortedNotifications = [...notifications].sort((a, b) => {
     if (a.pinned && !b.pinned) return -1;
     if (!a.pinned && b.pinned) return 1;
     return b.time - a.time;
   });
 
-  // Расширенная функция анализа изменений
   function analyzeDataChanges(newData) {
     let currentMassOlt = 0; let currentMassSw = 0;
     let currentDownSwitches = new Map();
     let currentDownOnus = new Map();
 
-    // 1. Собираем свежие данные
     newData.forEach(d => {
       if (d.isSwitch) {
         d.ports.forEach(folder => {
           if (folder.is_mass_outage) currentMassSw++;
           folder.onus.forEach(sw => {
-            const state = (sw.state || '').toLowerCase();
+            const state = (sw.state || '').trim().toLowerCase();
             if (!['working', 'host is alive'].includes(state)) {
               currentDownSwitches.set(sw.id, sw.contract || '—');
             }
@@ -117,8 +102,7 @@
         d.ports.forEach(port => {
           if (port.is_mass_outage) currentMassOlt++;
           port.onus.forEach(onu => {
-            const state = (onu.state || '').toLowerCase();
-            // Собираем ТОЛЬКО los, down и losi для уведомлений
+            const state = (onu.state || '').trim().toLowerCase();
             if (['los', 'down', 'losi'].includes(state)) {
               currentDownOnus.set(`${d.ip}:${onu.id}`, { contract: onu.contract || '—', state: state });
             }
@@ -127,10 +111,7 @@
       }
     });
 
-    // 2. Сравниваем с предыдущим состоянием (ТОЛЬКО если это не первая загрузка)
     if (!isFirstLoad) {
-      
-      // -- Массовые очаги OLT/Папок (по флагам бекенда) --
       if (currentMassOlt > knownState.massOlt) {
         addNotification('critical', 'МАССОВАЯ АВАРИЯ OLT', `Зафиксировано ${currentMassOlt} очагов GPON.`);
       }
@@ -138,22 +119,18 @@
         addNotification('critical', 'МАССОВАЯ АВАРИЯ SW', `Зафиксировано ${currentMassSw} локаций коммутаторов.`);
       }
 
-      // === АНТИ-СПАМ ЛОГИКА ===
       let newDownSw = []; let upSw = [];
       let newDownOnu = []; let upOnu = [];
 
-      // Собираем списки изменений
       currentDownSwitches.forEach((contract, id) => { if (!knownState.downSwitches.has(id)) newDownSw.push(id); });
       knownState.downSwitches.forEach((contract, id) => { if (!currentDownSwitches.has(id)) upSw.push(id); });
       
       currentDownOnus.forEach((data, id) => { if (!knownState.downOnus.has(id)) newDownOnu.push({id, contract: data.contract, state: data.state}); });
       knownState.downOnus.forEach((data, id) => { if (!currentDownOnus.has(id)) upOnu.push({id, contract: data.contract}); });
 
-      // ПОРОГИ СРАБАТЫВАНИЯ (Свыше какого количества схлопывать в одно уведомление)
       const SW_LIMIT = 5;  
       const ONU_LIMIT = 10; 
 
-      // -- Обработка коммутаторов --
       if (newDownSw.length > SW_LIMIT) {
         addNotification('critical', `МАССОВОЕ ПАДЕНИЕ SW`, `Сразу ${newDownSw.length} коммутаторов недоступны.\nВозможно потеря SNMP пакетов или падение магистрали.`);
       } else {
@@ -166,7 +143,6 @@
         upSw.forEach(id => addNotification('success', `КОММУТАТОР В СЕТИ`, `🔌 IP-адрес: ${id}`));
       }
 
-      // -- Обработка GPON клиентов --
       if (newDownOnu.length > ONU_LIMIT) {
         addNotification('warning', `МАССОВЫЙ ОТВАЛ (GPON)`, `Сразу ${newDownOnu.length} клиентов отвалились (LOS/LOSi).`);
       } else {
@@ -189,7 +165,6 @@
       }
     }
 
-    // 3. Сохраняем текущее состояние как эталон
     knownState.massOlt = currentMassOlt;
     knownState.massSw = currentMassSw;
     knownState.downSwitches = currentDownSwitches;
@@ -201,28 +176,17 @@
     if (isUpdating) return;
     try {
       isUpdating = true;
-      await fetch(`${BACKEND_URL}/api/update/force`, { method: 'POST' });
+      await fetch('/api/update/force', { method: 'POST' });
     } catch(e) { console.error("Ошибка принудительного обновления:", e); }
   }
-
-  onMount(() => { 
-    host = window.location.hostname; 
-    const storedTheme = localStorage.getItem('noc-theme');
-    if (storedTheme) isDark = storedTheme === 'dark';
-    else isDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-
-    if ("Notification" in window && Notification.permission !== "granted" && Notification.permission !== "denied") {
-      Notification.requestPermission();
-    }
-  });
 
   function toggleTheme() {
     isDark = !isDark;
     localStorage.setItem('noc-theme', isDark ? 'dark' : 'light');
   }
 
-  $: BACKEND_URL = `${window.location.protocol}//${window.location.host}`;
-  $: WS_URL = `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/ws`;
+  let BACKEND_URL = "";
+  let WS_URL = "";
 
   let activeTab = 'dash'; 
   let activeOltIndex = 0;
@@ -251,9 +215,18 @@
   // --- API ВЫЗОВЫ ---
   async function fetchDailyStats() {
     try {
-      const res = await fetch(`${BACKEND_URL}/api/stats/daily`);
-      dailyStats = await res.json();
-    } catch(e) { console.error("Ошибка загрузки отчета:", e); }
+      const res = await fetch('/api/stats/daily');
+      if (res.ok) {
+        const json = await res.json();
+        dailyStats = {
+          total_24h: json.total_24h ?? 0,
+          avg_repair_minutes: json.avg_repair_minutes ?? 0,
+          active_now: json.active_now ?? 0
+        };
+      }
+    } catch(e) { 
+      console.error("Ошибка загрузки отчета:", e); 
+    }
   }
 
   let activeHistoryRequest = null;
@@ -271,11 +244,10 @@
       const controller = new AbortController();
       activeHistoryRequest = controller; 
       
-      const timeoutId = setTimeout(() => {
-        controller.abort();
-      }, 5000); 
+      const timeoutId = setTimeout(() => { controller.abort(); }, 5000); 
 
-      const res = await fetch(`${BACKEND_URL}/api/history/${encodeURIComponent(id)}?days=30`, {
+      // Теперь используем красивый относительный путь. Nginx всё сделает сам!
+      const res = await fetch(`/api/history/${encodeURIComponent(id)}?days=30`, {
         signal: controller.signal,
         cache: 'no-store' 
       });
@@ -285,7 +257,9 @@
       if (!res.ok) throw new Error(`Ошибка сервера: ${res.status}`);
       
       const json = await res.json();
-      entityHistory = json.incidents || []; 
+      
+      // БЕРЕМ ДАННЫЕ НАПРЯМУЮ, БЕЗ ЛИШНЕГО ПАРСИНГА
+      entityHistory = json.incidents || json.data || [];
       
     } catch(e) {
       console.error("❌ Ошибка загрузки истории:", e);
@@ -333,8 +307,8 @@
   $: olts = data.filter(d => !d.isSwitch);
 
   $: filteredOlts = olts.filter(olt => {
-    if (globalLosFilter) return olt.ports.some(p => p.onus.some(o => ['los', 'down'].includes((o.state||'').toLowerCase())));
-    if (globalLosiFilter) return olt.ports.some(p => p.onus.some(o => (o.state||'').toLowerCase() === 'losi'));
+    if (globalLosFilter) return olt.ports.some(p => p.onus.some(o => ['los', 'down'].includes((o.state||'').trim().toLowerCase())));
+    if (globalLosiFilter) return olt.ports.some(p => p.onus.some(o => (o.state||'').trim().toLowerCase() === 'losi'));
     return true;
   });
   
@@ -343,8 +317,8 @@
 
   $: filteredPorts = (currentOlt.ports || [])
     .filter(port => {
-      const hasLos = port.onus.some(o => ['los', 'down'].includes((o.state||'').toLowerCase()));
-      const hasLosi = port.onus.some(o => (o.state||'').toLowerCase() === 'losi');
+      const hasLos = port.onus.some(o => ['los', 'down'].includes((o.state||'').trim().toLowerCase()));
+      const hasLosi = port.onus.some(o => (o.state||'').trim().toLowerCase() === 'losi');
       
       if (globalLosFilter && !hasLos) return false;
       if (globalLosiFilter && !hasLosi) return false;
@@ -356,8 +330,8 @@
     .sort((a, b) => {
       if (a.is_mass_outage && !b.is_mass_outage) return -1;
       if (!a.is_mass_outage && b.is_mass_outage) return 1;
-      const badA = a.onus.filter(o => ['los', 'down', 'losi'].includes((o.state||'').toLowerCase())).length;
-      const badB = b.onus.filter(o => ['los', 'down', 'losi'].includes((o.state||'').toLowerCase())).length;
+      const badA = a.onus.filter(o => ['los', 'down', 'losi'].includes((o.state||'').trim().toLowerCase())).length;
+      const badB = b.onus.filter(o => ['los', 'down', 'losi'].includes((o.state||'').trim().toLowerCase())).length;
       return badB - badA; 
     });
 
@@ -369,7 +343,7 @@
 
   $: filteredSwitchFolders = switchFolders.filter(folder => {
     if (!globalSwLosFilter) return true;
-    return folder.onus.some(sw => !['working', 'host is alive'].includes((sw.state||'').toLowerCase()));
+    return folder.onus.some(sw => !['working', 'host is alive'].includes((sw.state||'').trim().toLowerCase()));
   });
 
   $: if (activeFolderIndex >= filteredSwitchFolders.length) activeFolderIndex = 0;
@@ -378,23 +352,21 @@
 
   $: displayedSwitches = switchSearchQuery 
     ? allSwitchesFlat.filter(sw => sw.id.toLowerCase().includes(switchSearchQuery.toLowerCase()) || (sw.contract || '').toLowerCase().includes(switchSearchQuery.toLowerCase()))
-    : (currentSwitchFolder.onus || []).filter(sw => !globalSwLosFilter || !['working', 'host is alive'].includes((sw.state||'').toLowerCase()));
+    : (currentSwitchFolder.onus || []).filter(sw => !globalSwLosFilter || !['working', 'host is alive'].includes((sw.state||'').trim().toLowerCase()));
 
   $: totalStats = {
     onus: olts.reduce((acc, olt) => acc + olt.ports.flatMap(p => p.onus).length, 0),
-    online: olts.reduce((acc, olt) => acc + olt.ports.flatMap(p => p.onus).filter(o => o.state === 'working').length, 0),
-    los: olts.reduce((acc, olt) => acc + olt.ports.flatMap(p => p.onus).filter(o => ['los', 'down'].includes((o.state||'').toLowerCase())).length, 0),
-    losi: olts.reduce((acc, olt) => acc + olt.ports.flatMap(p => p.onus).filter(o => (o.state||'').toLowerCase() === 'losi').length, 0),
+    online: olts.reduce((acc, olt) => acc + olt.ports.flatMap(p => p.onus).filter(o => (o.state||'').trim().toLowerCase() === 'working').length, 0),
+    los: olts.reduce((acc, olt) => acc + olt.ports.flatMap(p => p.onus).filter(o => ['los', 'down'].includes((o.state||'').trim().toLowerCase())).length, 0),
+    losi: olts.reduce((acc, olt) => acc + olt.ports.flatMap(p => p.onus).filter(o => (o.state||'').trim().toLowerCase() === 'losi').length, 0),
     olts: olts.length,
     switches: allSwitchesFlat.length,
-    swUp: allSwitchesFlat.filter(sw => sw.state === 'working' || sw.state === 'Host is alive').length,
+    swUp: allSwitchesFlat.filter(sw => (sw.state||'').trim().toLowerCase() === 'working' || (sw.state||'').trim().toLowerCase() === 'host is alive').length,
     massOlt: olts.reduce((acc, olt) => acc + olt.ports.filter(p => p.is_mass_outage).length, 0),
     massSw: switchFolders.filter(f => f.is_mass_outage).length
   };
 
-  // --- НОВОЕ: БЕЗОПАСНЫЙ ГЛОБАЛЬНЫЙ ПОИСК (БЕЗ ЗАЦИКЛИВАНИЙ) ---
   function handleSearch() {
-    // Небольшая задержка, чтобы svelte успел обновить searchQuery
     setTimeout(() => {
       if (!searchQuery || searchQuery.trim().length < 4) return;
       const q = searchQuery.trim().toLowerCase();
@@ -409,20 +381,17 @@
             const contract = (onu.contract || '').toLowerCase();
             
             if (contract.includes(q)) {
-              const s = (onu.state || '').toLowerCase();
+              const s = (onu.state || '').trim().toLowerCase(); // ИСПРАВЛЕНИЕ ТУТ!
               const isLos = ['los', 'down'].includes(s);
               const isLosi = s === 'losi';
 
-              // Отключаем мешающие глобальные фильтры
               if (globalLosFilter && !isLos) globalLosFilter = false;
               if (globalLosiFilter && !isLosi) globalLosiFilter = false;
 
               tick().then(() => {
-                // Прыгаем на нужную OLT
                 const visibleOltIndex = filteredOlts.findIndex(o => o.ip === olt.ip);
                 if (visibleOltIndex !== -1) activeOltIndex = visibleOltIndex;
                 
-                // Выбираем правильную под-категорию
                 if (isLos) subFilter = 'los';
                 else if (isLosi) subFilter = 'losi';
                 else if (s === 'dyinggasp') subFilter = 'dying';
@@ -431,7 +400,6 @@
                 else subFilter = 'all';
 
                 tick().then(() => {
-                  // Раскрываем порт и перелистываем страницу к нему
                   activePort = port.name;
                   const pIndex = filteredPorts.findIndex(p => p.name === port.name);
                   if (pIndex !== -1) currentPage = Math.floor(pIndex / itemsPerPage) + 1;
@@ -520,7 +488,7 @@
   async function updateChartData() {
     await tick(); 
     const now = new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
-    const currentOutages = totalStats.los + totalStats.losi; // Учитываем LOS + LOSi
+    const currentOutages = totalStats.los + totalStats.losi;
     
     if (historyLabels.length > 0 && historyLabels[historyLabels.length - 1] === now) {
       historyData[historyData.length - 1] = currentOutages;
@@ -551,19 +519,19 @@
 
   const getStatusColor = (state) => {
     if (!state) return 'text-slate-500';
-    const s = state.toLowerCase();
+    const s = state.trim().toLowerCase();
     if (s === 'working' || s === 'host is alive') return 'text-emerald-500';
     if (s === 'dyinggasp') return 'text-orange-500';
-    if (s === 'losi') return 'text-fuchsia-500'; // НОВОЕ
+    if (s === 'losi') return 'text-fuchsia-500';
     return 'text-red-500';
   };
 
   const getDotColor = (state) => {
     if (!state) return 'bg-slate-500';
-    const s = state.toLowerCase();
+    const s = state.trim().toLowerCase();
     if (s === 'working' || s === 'host is alive') return 'bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.5)]';
     if (s === 'dyinggasp') return 'bg-orange-500 shadow-[0_0_8px_rgba(249,115,22,0.5)]';
-    if (s === 'losi') return 'bg-fuchsia-500 shadow-[0_0_8px_rgba(217,70,239,0.5)] animate-pulse'; // НОВОЕ
+    if (s === 'losi') return 'bg-fuchsia-500 shadow-[0_0_8px_rgba(217,70,239,0.5)] animate-pulse';
     return 'bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.5)] animate-pulse';
   };
 
@@ -573,7 +541,7 @@
     timeToNextUpdate = diff <= 0 ? "00:00" : `${Math.floor(diff/60)}:${(diff%60).toString().padStart(2,'0')}`;
   }
 
-let ws;
+  let ws;
   function connectWebSocket() {
     if (ws) ws.close();
     ws = new WebSocket(WS_URL);
@@ -595,7 +563,19 @@ let ws;
     ws.onerror = () => { ws.close(); };
   }
 
-  onMount(async () => {
+  onMount(() => {
+    host = window.location.hostname;
+    BACKEND_URL = `${window.location.protocol}//${window.location.host}`;
+    WS_URL = `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/ws`;
+
+    const storedTheme = localStorage.getItem('noc-theme');
+    if (storedTheme) isDark = storedTheme === 'dark';
+    else isDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+
+    if ("Notification" in window && Notification.permission !== "granted" && Notification.permission !== "denied") {
+      Notification.requestPermission();
+    }
+
     try {
       const savedLabels = localStorage.getItem('noc_chart_labels');
       const savedData = localStorage.getItem('noc_chart_data');
@@ -605,27 +585,29 @@ let ws;
       }
     } catch(e) { console.error("Ошибка чтения истории графика:", e); }
 
-    try {
-      const res = await fetch(`${BACKEND_URL}/api/data`);
-      const json = await res.json();
-      data = json.data; nextUpdateTs = json.next_update; isUpdating = json.is_updating;
-      await tick();
-      redrawChart();
-    } catch(e) {}
+    fetch('/api/data')
+      .then(res => res.json())
+      .then(async (json) => {
+        if (isFirstLoad) { 
+          data = json.data; nextUpdateTs = json.next_update; isUpdating = json.is_updating;
+          await tick();
+          redrawChart();
+        }
+      })
+      .catch(e => console.error("Ошибка API данных:", e));
 
     fetchDailyStats();
     setInterval(fetchDailyStats, 300000); 
+
     connectWebSocket();
     setInterval(updateTimer, 1000);
   });
 </script>
 
-<!-- Модальное окно истории -->
 {#if isModalOpen}
   <div class="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm" in:fade={{duration: 200}} out:fade={{duration: 200}}>
     <div class="w-full max-w-2xl rounded-3xl shadow-2xl overflow-hidden flex flex-col max-h-[85vh] {isDark ? 'bg-slate-900 border border-slate-700' : 'bg-white'}" in:scale={{start: 0.95, duration: 200}}>
       
-      <!-- Хедер модалки -->
       <div class="px-6 py-5 border-b flex justify-between items-center bg-gradient-to-r {isDark ? 'from-slate-800 to-slate-900 border-slate-700' : 'from-slate-50 to-white border-slate-200'}">
         <div>
           <h2 class="text-lg font-black tracking-tight {isDark ? 'text-white' : 'text-slate-900'}">История подключений</h2>
@@ -634,7 +616,6 @@ let ws;
         <button on:click={closeHistory} class="w-8 h-8 flex items-center justify-center rounded-full bg-slate-200/50 hover:bg-slate-300 transition-colors {isDark ? 'bg-slate-800 text-slate-400 hover:text-white' : 'text-slate-600'}">✕</button>
       </div>
 
-      <!-- Тело модалки -->
       <div class="p-6 overflow-y-auto flex-1 {isDark ? 'bg-slate-900' : 'bg-slate-50'} always-visible-scroll">
         {#if isHistoryLoading}
           <div class="flex flex-col items-center justify-center py-12 opacity-50">
@@ -661,7 +642,7 @@ let ws;
                       {event.end_time ? 'Восстановлено' : 'АКТИВНАЯ АВАРИЯ'}
                     </span>
                     <span class="text-[10px] font-bold px-2 py-0.5 rounded bg-slate-100 {isDark ? 'bg-slate-700 text-slate-300' : 'text-slate-600'}">
-                      {Math.floor(event.duration / 60)} мин
+                      {Math.floor(event.duration / 60)} мин {event.duration % 60} сек
                     </span>
                   </div>
                   <div class="text-xs font-bold {isDark ? 'text-slate-300' : 'text-slate-700'}">Начало: <span class="font-normal">{event.start_human}</span></div>
@@ -732,10 +713,8 @@ let ws;
                     </span>
                   </div>
                   
-                  <!-- НОВОЕ: Перенос строк и улучшенный интерлиньяж для маршрута -->
                   <p class="text-xs font-medium leading-relaxed whitespace-pre-line {isDark ? 'text-slate-300' : 'text-slate-600'}">{notif.body}</p>
                   
-                  <!-- Крестик закрытия -->
                   <button on:click|stopPropagation={() => removeNotification(notif.id)} class="absolute top-2.5 right-2 p-1 rounded-full opacity-40 hover:opacity-100 transition-opacity {isDark ? 'hover:bg-slate-700 text-slate-300' : 'hover:bg-slate-200 text-slate-600'}">
                     <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M6 18L18 6M6 6l12 12"/></svg>
                   </button>
@@ -779,10 +758,9 @@ let ws;
     {#if activeTab === 'dash'}
       <div class="flex flex-col gap-6 h-full min-h-0" in:fade>
         
-        <!-- ТОП ПАНЕЛЬ С КАРТОЧКАМИ (4 КОЛОНКИ) -->
+        <!-- ТОП ПАНЕЛЬ С КАРТОЧКАМИ -->
         <div class="grid grid-cols-4 gap-6 h-40 shrink-0">
           
-          <!-- Клиенты -->
           <div class="relative p-6 rounded-3xl overflow-hidden shadow-sm flex flex-col justify-between group {isDark ? 'bg-gradient-to-br from-slate-800 to-slate-900 border border-slate-700' : 'bg-white border border-slate-200'}">
             <div class="absolute top-0 right-0 p-4 opacity-10 transform translate-x-4 -translate-y-4 group-hover:scale-110 transition-transform duration-500">
                <svg class="w-24 h-24" fill="currentColor" viewBox="0 0 24 24"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>
@@ -802,7 +780,6 @@ let ws;
             </div>
           </div>
 
-          <!-- Коммутаторы -->
           <div class="relative p-6 rounded-3xl overflow-hidden shadow-sm flex flex-col justify-between group {isDark ? 'bg-gradient-to-br from-slate-800 to-slate-900 border border-slate-700' : 'bg-white border border-slate-200'}">
             <div class="absolute top-0 right-0 p-4 opacity-10 transform translate-x-4 -translate-y-4 group-hover:scale-110 transition-transform duration-500">
                <svg class="w-24 h-24" fill="currentColor" viewBox="0 0 24 24"><path d="M4 10h3v7H4zM10.5 10h3v7h-3zM2 19h20v3H2zM17 10h3v7h-3zM12 1v8h-1V1zM8 1v8H7V1zM16 1v8h-1V1z"/></svg>
@@ -819,7 +796,6 @@ let ws;
             </div>
           </div>
 
-          <!-- Аварии сети -->
           <div class="p-6 rounded-3xl border shadow-sm flex flex-col justify-center {isDark ? 'bg-gradient-to-br from-slate-800 to-slate-900 border-slate-700' : 'bg-white border-slate-200'}">
             <span class="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-4">Статус локаций</span>
             <div class="space-y-3">
@@ -838,14 +814,13 @@ let ws;
             </div>
           </div>
 
-          <!-- Отчет за сутки -->
           <div class="p-6 rounded-3xl border shadow-sm flex flex-col justify-center relative overflow-hidden {isDark ? 'bg-gradient-to-br from-indigo-900/40 to-slate-900 border-indigo-500/30' : 'bg-gradient-to-br from-indigo-50 to-white border-indigo-200'}">
             <div class="absolute -right-6 -top-6 w-24 h-24 bg-indigo-500/20 rounded-full blur-2xl"></div>
             <span class="text-[10px] font-black text-indigo-400 uppercase tracking-widest mb-3">Суточный Отчет (24ч)</span>
             
             <div class="flex justify-between items-end mb-2 border-b pb-2 {isDark ? 'border-slate-700' : 'border-indigo-100'}">
               <span class="text-xs font-bold {isDark ? 'text-slate-300' : 'text-slate-600'}">Всего за 24 часа:</span>
-              <span class="text-lg font-black text-indigo-500">{dailyStats.total_24h}</span>
+              <span class="text-lg font-black text-indigo-500">{dailyStats.total_24h ?? 0}</span>
             </div>
             <div class="flex justify-between items-end">
               <span class="text-xs font-bold {isDark ? 'text-slate-300' : 'text-slate-600'}">Активно сейчас:</span>
@@ -857,7 +832,6 @@ let ws;
 
         </div>
 
-        <!-- ГРАФИК (Используем use:chartSetup) -->
         <div class="flex-1 p-6 min-h-0 rounded-3xl border shadow-sm flex flex-col relative {isDark ? 'bg-slate-900 border-slate-700' : 'bg-white border-slate-200'}">
           <div class="absolute top-6 right-6 flex items-center gap-2">
             <span class="w-3 h-3 rounded-full bg-indigo-500 shadow-[0_0_8px_rgba(99,102,241,0.8)]"></span>
@@ -873,7 +847,6 @@ let ws;
     {:else if activeTab === 'olt'}
       <div class="flex gap-6 h-full overflow-hidden min-h-0" in:fade>
         
-        <!-- Левое меню (ОЛТы) с надежным скроллом -->
         <div class="w-64 h-full flex flex-col gap-2 overflow-y-auto pr-2 pb-4 always-visible-scroll min-h-0">
           <h3 class="text-[10px] shrink-0 font-black text-slate-400 uppercase mb-2 px-2 tracking-widest">Список OLT</h3>
           
@@ -883,9 +856,9 @@ let ws;
 
           {#each filteredOlts as olt, i}
             {@const allOnus = olt.ports.flatMap(p => p.onus)}
-            {@const onlineCount = allOnus.filter(o => (o.state||'').toLowerCase() === 'working').length}
-            {@const losCount = allOnus.filter(o => ['los', 'down'].includes((o.state||'').toLowerCase())).length}
-            {@const losiCount = allOnus.filter(o => (o.state||'').toLowerCase() === 'losi').length}
+            {@const onlineCount = allOnus.filter(o => (o.state||'').trim().toLowerCase() === 'working').length}
+            {@const losCount = allOnus.filter(o => ['los', 'down'].includes((o.state||'').trim().toLowerCase())).length}
+            {@const losiCount = allOnus.filter(o => (o.state||'').trim().toLowerCase() === 'losi').length}
             {@const hasMass = olt.ports.some(p => p.is_mass_outage)}
             
             <button on:click={() => {activeOltIndex = i; currentPage = 1;}}
@@ -894,7 +867,6 @@ let ws;
                 <div class="absolute -top-1 -right-1 w-3 h-3 bg-red-500 rounded-full animate-ping"></div>
                 <div class="absolute -top-1 -right-1 w-3 h-3 bg-red-500 rounded-full shadow-md"></div>
               {/if}
-              <!-- Верхняя строка: IP и количество LOS (справа) -->
               <div class="flex justify-between items-start">
                 <div class="font-bold text-sm {isDark ? 'text-slate-200' : 'text-slate-900'}">{olt.ip}</div>
                 <div class="flex flex-col gap-1 items-end">
@@ -907,7 +879,6 @@ let ws;
                 </div>
               </div>
               
-              <!-- Нижняя строка: Прогресс-бар и общий счетчик -->
               <div class="flex justify-between mt-2.5 items-center">
                 <div class="flex-1 h-1 bg-slate-200 rounded-full overflow-hidden {isDark ? 'bg-slate-700' : ''}">
                   <div class="bg-indigo-500 h-full" style="width: {(onlineCount/allOnus.length)*100}%"></div>
@@ -920,7 +891,6 @@ let ws;
           {/each}
         </div>
 
-        <!-- Центральная часть -->
         <div class="flex-1 flex flex-col gap-4 h-full min-w-0 min-h-0">
           <div class="flex gap-3 shrink-0">
             <input type="text" bind:value={searchQuery} on:input={handleSearch} placeholder="Поиск по интерфейсу или договору..." 
@@ -935,12 +905,11 @@ let ws;
             </button>
           </div>
 
-          <!-- Список портов с надежным скроллом -->
           <div class="flex-1 overflow-y-auto space-y-3 pr-2 pb-4 always-visible-scroll min-h-0">
             {#each paginatedPorts as port}
               {@const pOnus = port.onus}
-              {@const strictLosCount = pOnus.filter(o => ['los', 'down'].includes((o.state||'').toLowerCase())).length}
-              {@const losiCount = pOnus.filter(o => (o.state||'').toLowerCase() === 'losi').length}
+              {@const strictLosCount = pOnus.filter(o => ['los', 'down'].includes((o.state||'').trim().toLowerCase())).length}
+              {@const losiCount = pOnus.filter(o => (o.state||'').trim().toLowerCase() === 'losi').length}
               
               <div class="rounded-2xl shrink-0 shadow-sm border overflow-hidden transition-colors {port.is_mass_outage ? (isDark ? 'border-red-900 bg-red-900/10' : 'border-red-300 bg-red-50') : (isDark ? 'bg-slate-800 border-slate-700' : 'bg-white border-slate-200')}">
                 <div class="flex items-center justify-between pr-4 cursor-pointer hover:opacity-80 transition-opacity" on:click={() => { activePort = activePort === port.name ? null : port.name; subFilter = globalLosFilter ? 'los' : (globalLosiFilter ? 'losi' : 'all'); }}>
@@ -969,11 +938,11 @@ let ws;
                     <div class="flex flex-wrap gap-2 mb-4 border-b pb-4 {isDark ? 'border-slate-700' : 'border-slate-200'}">
                       {#each [
                         {id: 'all', label: 'Все', count: pOnus.length},
-                        {id: 'online', label: 'В сети', count: pOnus.filter(o => (o.state||'').toLowerCase() === 'working').length},
+                        {id: 'online', label: 'В сети', count: pOnus.filter(o => (o.state||'').trim().toLowerCase() === 'working').length},
                         {id: 'los', label: 'LOS', count: strictLosCount},
                         {id: 'losi', label: 'LOSi', count: losiCount},
-                        {id: 'dying', label: 'DyingGasp', count: pOnus.filter(o => (o.state||'').toLowerCase() === 'dyinggasp').length},
-                        {id: 'offline', label: 'Offline', count: pOnus.filter(o => (o.state||'').toLowerCase() === 'offline').length}
+                        {id: 'dying', label: 'DyingGasp', count: pOnus.filter(o => (o.state||'').trim().toLowerCase() === 'dyinggasp').length},
+                        {id: 'offline', label: 'Offline', count: pOnus.filter(o => (o.state||'').trim().toLowerCase() === 'offline').length}
                       ] as filter}
                         <button on:click={() => subFilter = filter.id}
                           class="text-[10px] font-black uppercase tracking-widest px-3 py-1.5 rounded-lg transition-all 
@@ -987,7 +956,7 @@ let ws;
                     
                     <div class="grid grid-cols-5 gap-3">
                       {#each pOnus.filter(o => {
-                        const s = (o.state || '').toLowerCase();
+                        const s = (o.state || '').trim().toLowerCase();
                         if (subFilter === 'online') return s === 'working';
                         if (subFilter === 'los') return ['los', 'down'].includes(s);
                         if (subFilter === 'losi') return s === 'losi';
@@ -1007,7 +976,7 @@ let ws;
                           
                           <div class="flex justify-between items-end mt-2 pt-2 border-t {isDark ? 'border-slate-700' : 'border-slate-100'}">
                             <div class="text-[9px] font-black uppercase tracking-wider {getStatusColor(onu.state)}">{onu.state}</div>
-                            {#if !['working', 'host is alive'].includes((onu.state || '').toLowerCase()) && onu.los_time}
+                            {#if !['working', 'host is alive'].includes((onu.state || '').trim().toLowerCase()) && onu.los_time}
                               <div class="text-[9px] font-bold text-red-500">⏱ {formatLosTime(onu.los_time)}</div>
                             {/if}
                           </div>
@@ -1022,7 +991,6 @@ let ws;
               </div>
             {/each}
           </div>
-          <!-- ПАГИНАЦИЯ -->
           {#if totalPages > 1}
             <div class="shrink-0 flex items-center justify-center gap-2 pt-2">
               <button
@@ -1070,7 +1038,6 @@ let ws;
     {:else if activeTab === 'sw'}
       <div class="flex gap-6 h-full overflow-hidden min-h-0" in:fade>
         {#if !switchSearchQuery}
-          <!-- Левое меню коммутаторов с надежным скроллом -->
           <div class="w-64 h-full flex flex-col gap-2 overflow-y-auto pr-2 pb-4 always-visible-scroll min-h-0" transition:slide={{ axis: 'x' }}>
             <h3 class="text-[10px] shrink-0 font-black text-slate-400 uppercase mb-2 px-2 tracking-widest">Локации</h3>
             
@@ -1079,7 +1046,7 @@ let ws;
             {/if}
 
             {#each filteredSwitchFolders as folder, i}
-              {@const downs = folder.onus.filter(s => !['working', 'host is alive'].includes((s.state||'').toLowerCase())).length}
+              {@const downs = folder.onus.filter(s => !['working', 'host is alive'].includes((s.state||'').trim().toLowerCase())).length}
               <button on:click={() => activeFolderIndex = i} class="p-4 shrink-0 rounded-2xl border text-left transition-all relative {activeFolderIndex === i ? (isDark ? 'bg-slate-800 border-indigo-500 ring-1 ring-indigo-500 shadow-md' : 'bg-white border-indigo-400 ring-1 ring-indigo-400 shadow-md') : (isDark ? 'bg-slate-800/50 border-slate-800' : 'bg-slate-50 border-slate-200')}">
                 {#if folder.is_mass_outage} <div class="absolute -top-1 -right-1 w-3 h-3 bg-red-500 rounded-full animate-ping"></div><div class="absolute -top-1 -right-1 w-3 h-3 bg-red-500 rounded-full shadow-md"></div> {/if}
                 <div class="font-bold text-sm truncate {isDark ? 'text-slate-200' : 'text-slate-800'}">{folder.name}</div>
@@ -1105,10 +1072,9 @@ let ws;
             </button>
           </div>
           
-          <!-- Сетка с коммутаторами с надежным скроллом -->
           <div class="flex-1 grid grid-cols-4 gap-4 overflow-y-auto pr-2 pb-4 content-start always-visible-scroll min-h-0">
             {#each displayedSwitches as sw}
-              <div class="p-5 rounded-3xl border shadow-sm flex flex-col justify-between cursor-pointer transition-all group {['working', 'host is alive'].includes((sw.state||'').toLowerCase()) ? (isDark ? 'bg-slate-800 border-slate-700 hover:border-indigo-500' : 'bg-white border-slate-200 hover:border-indigo-300') : (isDark ? 'border-red-900 bg-red-900/10 hover:border-red-500' : 'border-red-300 bg-red-50 hover:border-red-400')}"
+              <div class="p-5 rounded-3xl border shadow-sm flex flex-col justify-between cursor-pointer transition-all group {['working', 'host is alive'].includes((sw.state||'').trim().toLowerCase()) ? (isDark ? 'bg-slate-800 border-slate-700 hover:border-indigo-500' : 'bg-white border-slate-200 hover:border-indigo-300') : (isDark ? 'border-red-900 bg-red-900/10 hover:border-red-500' : 'border-red-300 bg-red-50 hover:border-red-400')}"
                    on:click={() => openHistory(sw.contract, sw.id, 'sw')}>
                 <div>
                   <div class="flex justify-between items-start mb-2">
@@ -1119,7 +1085,7 @@ let ws;
                 </div>
                 <div class="mt-4 pt-3 border-t flex justify-between items-end {isDark ? 'border-slate-700' : 'border-slate-100'}">
                   <div class="text-[10px] font-black uppercase tracking-wider {getStatusColor(sw.state)}">{sw.state}</div>
-                  {#if !['working', 'host is alive'].includes((sw.state||'').toLowerCase()) && sw.los_time}
+                  {#if !['working', 'host is alive'].includes((sw.state||'').trim().toLowerCase()) && sw.los_time}
                     <div class="text-[10px] font-black text-red-500">⏱ {formatLosTime(sw.los_time)}</div>
                   {/if}
                 </div>

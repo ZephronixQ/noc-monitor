@@ -60,7 +60,9 @@ docker compose up --build
 ```
 
 > Требуется установленный [Docker](https://docs.docker.com/get-docker/).  
-> Интерфейс доступен по адресу: `http://localhost:5173`
+> Интерфейс доступен по адресу: `http://<Public IP>`.
+> WebSocket и API проксируются через nginx.  
+> Порт 8000 (backend) наружу не открывается.
 
 Предпочитаете ручной запуск без Docker? → 📄 [docs/manual-setup.md](docs/manual-setup.md)
 
