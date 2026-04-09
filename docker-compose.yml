@@ -1,17 +1,18 @@
-version: '3.8'
 services:
   backend:
     build:
       context: ./backend
       dockerfile: Dockerfile.backend
     container_name: noc-backend
-    ports:
-      - "8000:8000"
+    expose:
+      - "8000"
     volumes:
       - ./backend/data:/app/backend/data
     environment:
       - TZ=Europe/Moscow
-    restart: unless-stopped
+    restart: always
+    networks:
+      - internal
 
   frontend:
     build:
@@ -22,4 +23,10 @@ services:
       - "80:80"
     depends_on:
       - backend
-    restart: unless-stopped
+    restart: always
+    networks:
+      - internal
+
+networks:
+  internal:
+    driver: bridge

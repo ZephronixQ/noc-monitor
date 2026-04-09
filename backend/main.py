@@ -13,7 +13,8 @@ from network.snmp_client import check_switch_snmp
 from utils.event_logger import log_switch_event, get_history, get_daily_stats_json, save_json_db, close_all_open_incidents
 from ws_manager import ws_manager
 
-LOS_STATES = {"LOS", "DOWN"}
+# ТЕПЕРЬ LOSI СЧИТАЕТСЯ АВАРИЕЙ СЕТИ ТАК ЖЕ, КАК LOS И DOWN
+LOS_STATES = {"LOS", "DOWN", "LOSI"}
 
 INTERNAL_STATE = {
     "olt_results": [],
@@ -26,7 +27,6 @@ INTERNAL_STATE = {
 
 GLOBAL_STATE = {"data": [], "next_update": 0, "is_updating": False}
 
-# Событие для принудительного обновления OLT
 force_update_event = asyncio.Event()
 
 def refresh_global_state():
@@ -49,7 +49,9 @@ def _track_events(olt_results: list) -> None:
         olt_ip = olt["ip"]
         for port in olt.get("ports", []):
             total_onus = len(port.get("onus", []))
-            strict_los_count = sum(1 for onu in port.get("onus", []) if onu["state"].upper() in ["LOS", "DOWN"])
+            
+            # В счетчик массовых аварий мы учитываем все виды обрывов
+            strict_los_count = sum(1 for onu in port.get("onus", []) if onu["state"].upper() in LOS_STATES)
 
             for onu in port.get("onus", []):
                 onu_id   = onu["id"]
@@ -57,16 +59,16 @@ def _track_events(olt_results: list) -> None:
                 contract = onu.get("contract", "—")
                 key      = f"{olt_ip}:{onu_id}"
 
-                is_los = state.upper() in [s.upper() for s in LOS_STATES]
+                is_los = state.upper() in LOS_STATES
                 prev_data = prev.get(key, {})
                 prev_state = prev_data.get("state")
                 los_start = prev_data.get("los_start")
 
-                if is_los and str(prev_state).upper() not in [s.upper() for s in LOS_STATES]:
+                if is_los and str(prev_state).upper() not in LOS_STATES:
                     los_start = now
-                elif not is_los and str(prev_state).upper() in [s.upper() for s in LOS_STATES]:
+                elif not is_los and str(prev_state).upper() in LOS_STATES:
                     los_start = None
-                elif is_los and str(prev_state).upper() in [s.upper() for s in LOS_STATES]:
+                elif is_los and str(prev_state).upper() in LOS_STATES:
                     los_start = prev_data.get("los_start", now)
 
                 curr[key] = {"state": state, "contract": contract, "onu_id": onu_id, "olt_ip": olt_ip, "los_start": los_start}
@@ -213,12 +215,11 @@ async def poll_olt_loop():
             "is_sw_only": False,
         })
         
-        # Ждем POLL_INTERVAL_SEC или пока не дернут force_update_event
         try:
             await asyncio.wait_for(force_update_event.wait(), timeout=POLL_INTERVAL_SEC)
-            force_update_event.clear() # Сбрасываем флаг, если он сработал
+            force_update_event.clear()
         except asyncio.TimeoutError:
-            pass # Истек таймаут, обновляем по графику
+            pass
 
 
 @asynccontextmanager
@@ -254,7 +255,6 @@ async def get_contract_history(target_id: str, days: int = 30):
     except Exception as e:
         return {"target_id": target_id, "days": days, "incidents": [], "error": str(e)}
 
-# ЭНДПОИНТ ПРИНУДИТЕЛЬНОГО ОБНОВЛЕНИЯ
 @app.post("/api/update/force")
 async def trigger_force_update():
     force_update_event.set()

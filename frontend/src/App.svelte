@@ -6,7 +6,7 @@
   import { onMount, tick } from 'svelte';
   import { slide, fade, scale } from 'svelte/transition';
   
-  let host = "localhost"; 
+  // let host = "localhost"; 
   let isDark = false;
   let wsConnected = false;
 
@@ -118,9 +118,9 @@
           if (port.is_mass_outage) currentMassOlt++;
           port.onus.forEach(onu => {
             const state = (onu.state || '').toLowerCase();
-            // Собираем ТОЛЬКО los и down для уведомлений
-            if (['los', 'down'].includes(state)) {
-              currentDownOnus.set(`${d.ip}:${onu.id}`, onu.contract || '—');
+            // Собираем ТОЛЬКО los, down и losi для уведомлений
+            if (['los', 'down', 'losi'].includes(state)) {
+              currentDownOnus.set(`${d.ip}:${onu.id}`, { contract: onu.contract || '—', state: state });
             }
           });
         });
@@ -146,8 +146,8 @@
       currentDownSwitches.forEach((contract, id) => { if (!knownState.downSwitches.has(id)) newDownSw.push(id); });
       knownState.downSwitches.forEach((contract, id) => { if (!currentDownSwitches.has(id)) upSw.push(id); });
       
-      currentDownOnus.forEach((contract, id) => { if (!knownState.downOnus.has(id)) newDownOnu.push({id, contract}); });
-      knownState.downOnus.forEach((contract, id) => { if (!currentDownOnus.has(id)) upOnu.push({id, contract}); });
+      currentDownOnus.forEach((data, id) => { if (!knownState.downOnus.has(id)) newDownOnu.push({id, contract: data.contract, state: data.state}); });
+      knownState.downOnus.forEach((data, id) => { if (!currentDownOnus.has(id)) upOnu.push({id, contract: data.contract}); });
 
       // ПОРОГИ СРАБАТЫВАНИЯ (Свыше какого количества схлопывать в одно уведомление)
       const SW_LIMIT = 5;  
@@ -168,12 +168,13 @@
 
       // -- Обработка GPON клиентов --
       if (newDownOnu.length > ONU_LIMIT) {
-        addNotification('warning', `МАССОВЫЙ LOS (GPON)`, `Сразу ${newDownOnu.length} клиентов отвалились (LOS/Down).`);
+        addNotification('warning', `МАССОВЫЙ ОТВАЛ (GPON)`, `Сразу ${newDownOnu.length} клиентов отвалились (LOS/LOSi).`);
       } else {
         newDownOnu.forEach(onu => {
           const p = onu.id.split(':');
           const route = p.length === 3 ? `[${p[0]}] ➔ [${p[1]}] ➔ ONU ${p[2]}` : onu.id;
-          addNotification('warning', `АВАРИЯ GPON (LOS)`, `👤 Договор: ${onu.contract}\n🔌 Маршрут: ${route}`);
+          const statusName = onu.state.toUpperCase();
+          addNotification('warning', `АВАРИЯ GPON (${statusName})`, `👤 Договор: ${onu.contract}\n🔌 Маршрут: ${route}`);
         });
       }
 
@@ -203,10 +204,9 @@
       await fetch(`${BACKEND_URL}/api/update/force`, { method: 'POST' });
     } catch(e) { console.error("Ошибка принудительного обновления:", e); }
   }
-  // --- КОНЕЦ НОВОГО ---
 
   onMount(() => { 
-    host = window.location.hostname; 
+    // host = window.location.hostname; 
     const storedTheme = localStorage.getItem('noc-theme');
     if (storedTheme) isDark = storedTheme === 'dark';
     else isDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
@@ -232,6 +232,7 @@
   let switchSearchQuery = ''; 
   
   let globalLosFilter = false;
+  let globalLosiFilter = false;
   let globalSwLosFilter = false;
   let activePort = null;
   let subFilter = 'all'; 
@@ -332,8 +333,9 @@
   $: olts = data.filter(d => !d.isSwitch);
 
   $: filteredOlts = olts.filter(olt => {
-    if (!globalLosFilter) return true;
-    return olt.ports.some(p => p.onus.some(o => ['los', 'down'].includes((o.state||'').toLowerCase())));
+    if (globalLosFilter) return olt.ports.some(p => p.onus.some(o => ['los', 'down'].includes((o.state||'').toLowerCase())));
+    if (globalLosiFilter) return olt.ports.some(p => p.onus.some(o => (o.state||'').toLowerCase() === 'losi'));
+    return true;
   });
   
   $: if (activeOltIndex >= filteredOlts.length) activeOltIndex = 0;
@@ -342,7 +344,11 @@
   $: filteredPorts = (currentOlt.ports || [])
     .filter(port => {
       const hasLos = port.onus.some(o => ['los', 'down'].includes((o.state||'').toLowerCase()));
+      const hasLosi = port.onus.some(o => (o.state||'').toLowerCase() === 'losi');
+      
       if (globalLosFilter && !hasLos) return false;
+      if (globalLosiFilter && !hasLosi) return false;
+      
       if (!searchQuery) return true;
       const q = searchQuery.toLowerCase();
       return port.name.toLowerCase().includes(q) || port.onus.some(o => (o.contract || '').toLowerCase().includes(q));
@@ -350,8 +356,8 @@
     .sort((a, b) => {
       if (a.is_mass_outage && !b.is_mass_outage) return -1;
       if (!a.is_mass_outage && b.is_mass_outage) return 1;
-      const badA = a.onus.filter(o => ['los', 'down'].includes((o.state||'').toLowerCase())).length;
-      const badB = b.onus.filter(o => ['los', 'down'].includes((o.state||'').toLowerCase())).length;
+      const badA = a.onus.filter(o => ['los', 'down', 'losi'].includes((o.state||'').toLowerCase())).length;
+      const badB = b.onus.filter(o => ['los', 'down', 'losi'].includes((o.state||'').toLowerCase())).length;
       return badB - badA; 
     });
 
@@ -378,12 +384,70 @@
     onus: olts.reduce((acc, olt) => acc + olt.ports.flatMap(p => p.onus).length, 0),
     online: olts.reduce((acc, olt) => acc + olt.ports.flatMap(p => p.onus).filter(o => o.state === 'working').length, 0),
     los: olts.reduce((acc, olt) => acc + olt.ports.flatMap(p => p.onus).filter(o => ['los', 'down'].includes((o.state||'').toLowerCase())).length, 0),
+    losi: olts.reduce((acc, olt) => acc + olt.ports.flatMap(p => p.onus).filter(o => (o.state||'').toLowerCase() === 'losi').length, 0),
     olts: olts.length,
     switches: allSwitchesFlat.length,
     swUp: allSwitchesFlat.filter(sw => sw.state === 'working' || sw.state === 'Host is alive').length,
     massOlt: olts.reduce((acc, olt) => acc + olt.ports.filter(p => p.is_mass_outage).length, 0),
     massSw: switchFolders.filter(f => f.is_mass_outage).length
   };
+
+  // --- НОВОЕ: БЕЗОПАСНЫЙ ГЛОБАЛЬНЫЙ ПОИСК (БЕЗ ЗАЦИКЛИВАНИЙ) ---
+  function handleSearch() {
+    // Небольшая задержка, чтобы svelte успел обновить searchQuery
+    setTimeout(() => {
+      if (!searchQuery || searchQuery.trim().length < 4) return;
+      const q = searchQuery.trim().toLowerCase();
+      let found = false;
+
+      for (let i = 0; i < olts.length; i++) {
+        const olt = olts[i];
+        for (let j = 0; j < olt.ports.length; j++) {
+          const port = olt.ports[j];
+          for (let k = 0; k < port.onus.length; k++) {
+            const onu = port.onus[k];
+            const contract = (onu.contract || '').toLowerCase();
+            
+            if (contract.includes(q)) {
+              const s = (onu.state || '').toLowerCase();
+              const isLos = ['los', 'down'].includes(s);
+              const isLosi = s === 'losi';
+
+              // Отключаем мешающие глобальные фильтры
+              if (globalLosFilter && !isLos) globalLosFilter = false;
+              if (globalLosiFilter && !isLosi) globalLosiFilter = false;
+
+              tick().then(() => {
+                // Прыгаем на нужную OLT
+                const visibleOltIndex = filteredOlts.findIndex(o => o.ip === olt.ip);
+                if (visibleOltIndex !== -1) activeOltIndex = visibleOltIndex;
+                
+                // Выбираем правильную под-категорию
+                if (isLos) subFilter = 'los';
+                else if (isLosi) subFilter = 'losi';
+                else if (s === 'dyinggasp') subFilter = 'dying';
+                else if (s === 'offline') subFilter = 'offline';
+                else if (s === 'working' || s === 'host is alive') subFilter = 'online';
+                else subFilter = 'all';
+
+                tick().then(() => {
+                  // Раскрываем порт и перелистываем страницу к нему
+                  activePort = port.name;
+                  const pIndex = filteredPorts.findIndex(p => p.name === port.name);
+                  if (pIndex !== -1) currentPage = Math.floor(pIndex / itemsPerPage) + 1;
+                });
+              });
+
+              found = true; 
+              break;
+            }
+          }
+          if (found) break;
+        }
+        if (found) break;
+      }
+    }, 10);
+  }
 
   // --- ГРАФИКИ ---
   let chartCanvas;
@@ -439,7 +503,7 @@
     if (!chartCanvas) return;
     chartInstance = new Chart(chartCanvas, {
       type: 'line',
-      data: { labels: historyLabels, datasets: [{ label: 'LOS', data: historyData, fill: true, tension: 0.4, borderWidth: 3, pointRadius: 4 }] },
+      data: { labels: historyLabels, datasets: [{ label: 'Потери', data: historyData, fill: true, tension: 0.4, borderWidth: 3, pointRadius: 4 }] },
       options: { responsive: true, maintainAspectRatio: false, animation: false, plugins: { legend: { display: false }, tooltip: { mode: 'index', intersect: false } }, interaction: { mode: 'nearest', axis: 'x', intersect: false } }
     });
     updateChartTheme(isDark);
@@ -456,13 +520,14 @@
   async function updateChartData() {
     await tick(); 
     const now = new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+    const currentOutages = totalStats.los + totalStats.losi; // Учитываем LOS + LOSi
     
     if (historyLabels.length > 0 && historyLabels[historyLabels.length - 1] === now) {
-      historyData[historyData.length - 1] = totalStats.los;
+      historyData[historyData.length - 1] = currentOutages;
     } else {
       if (historyLabels.length > 30) { historyLabels.shift(); historyData.shift(); }
       historyLabels.push(now);
-      historyData.push(totalStats.los);
+      historyData.push(currentOutages);
     }
     
     localStorage.setItem('noc_chart_labels', JSON.stringify(historyLabels));
@@ -489,6 +554,7 @@
     const s = state.toLowerCase();
     if (s === 'working' || s === 'host is alive') return 'text-emerald-500';
     if (s === 'dyinggasp') return 'text-orange-500';
+    if (s === 'losi') return 'text-fuchsia-500'; // НОВОЕ
     return 'text-red-500';
   };
 
@@ -497,6 +563,7 @@
     const s = state.toLowerCase();
     if (s === 'working' || s === 'host is alive') return 'bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.5)]';
     if (s === 'dyinggasp') return 'bg-orange-500 shadow-[0_0_8px_rgba(249,115,22,0.5)]';
+    if (s === 'losi') return 'bg-fuchsia-500 shadow-[0_0_8px_rgba(217,70,239,0.5)] animate-pulse'; // НОВОЕ
     return 'bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.5)] animate-pulse';
   };
 
@@ -727,7 +794,10 @@ let ws;
                 <div class="flex-1 h-1.5 rounded-full overflow-hidden bg-slate-200/20 {isDark ? 'bg-slate-700' : 'bg-slate-100'}">
                   <div class="bg-emerald-500 h-full shadow-[0_0_10px_rgba(16,185,129,0.8)]" style="width: {(totalStats.online/totalStats.onus)*100}%"></div>
                 </div>
-                <span class="text-xs font-bold text-red-500">{totalStats.los} LOS</span>
+                <div class="flex flex-col leading-none text-right gap-1 shrink-0">
+                  <span class="text-[11px] font-black text-red-500">{totalStats.los} LOS</span>
+                  <span class="text-[11px] font-black text-fuchsia-500">{totalStats.losi} LOSi</span>
+                </div>
               </div>
             </div>
           </div>
@@ -791,7 +861,7 @@ let ws;
         <div class="flex-1 p-6 min-h-0 rounded-3xl border shadow-sm flex flex-col relative {isDark ? 'bg-slate-900 border-slate-700' : 'bg-white border-slate-200'}">
           <div class="absolute top-6 right-6 flex items-center gap-2">
             <span class="w-3 h-3 rounded-full bg-indigo-500 shadow-[0_0_8px_rgba(99,102,241,0.8)]"></span>
-            <span class="text-[10px] font-black text-slate-400 uppercase">Динамика LOS</span>
+            <span class="text-[10px] font-black text-slate-400 uppercase">Динамика потерь (LOS+LOSi)</span>
           </div>
           <div class="flex-1 w-full h-full mt-4">
             <canvas use:chartSetup></canvas>
@@ -815,6 +885,7 @@ let ws;
             {@const allOnus = olt.ports.flatMap(p => p.onus)}
             {@const onlineCount = allOnus.filter(o => (o.state||'').toLowerCase() === 'working').length}
             {@const losCount = allOnus.filter(o => ['los', 'down'].includes((o.state||'').toLowerCase())).length}
+            {@const losiCount = allOnus.filter(o => (o.state||'').toLowerCase() === 'losi').length}
             {@const hasMass = olt.ports.some(p => p.is_mass_outage)}
             
             <button on:click={() => {activeOltIndex = i; currentPage = 1;}}
@@ -826,9 +897,14 @@ let ws;
               <!-- Верхняя строка: IP и количество LOS (справа) -->
               <div class="flex justify-between items-start">
                 <div class="font-bold text-sm {isDark ? 'text-slate-200' : 'text-slate-900'}">{olt.ip}</div>
-                {#if losCount > 0}
-                  <span class="text-[9px] font-black text-red-500 bg-red-500/10 px-1.5 py-0.5 rounded">{losCount} LOS</span>
-                {/if}
+                <div class="flex flex-col gap-1 items-end">
+                  {#if losCount > 0}
+                    <span class="text-[9px] font-black text-red-500 bg-red-500/10 px-1.5 py-0.5 rounded whitespace-nowrap">{losCount} LOS</span>
+                  {/if}
+                  {#if losiCount > 0}
+                    <span class="text-[9px] font-black text-fuchsia-500 bg-fuchsia-500/10 px-1.5 py-0.5 rounded whitespace-nowrap">{losiCount} LOSi</span>
+                  {/if}
+                </div>
               </div>
               
               <!-- Нижняя строка: Прогресс-бар и общий счетчик -->
@@ -847,11 +923,15 @@ let ws;
         <!-- Центральная часть -->
         <div class="flex-1 flex flex-col gap-4 h-full min-w-0 min-h-0">
           <div class="flex gap-3 shrink-0">
-            <input type="text" bind:value={searchQuery} placeholder="Поиск по интерфейсу или договору..." 
+            <input type="text" bind:value={searchQuery} on:input={handleSearch} placeholder="Поиск по интерфейсу или договору..." 
               class="flex-1 rounded-2xl px-6 py-3 shadow-sm outline-none transition-all font-bold {isDark ? 'bg-slate-900 text-slate-200 placeholder-slate-600 border border-slate-700 focus:border-indigo-500' : 'bg-white border border-slate-200 focus:border-indigo-400 text-slate-900'}" />
-            <button on:click={() => {globalLosFilter = !globalLosFilter; currentPage = 1;}} 
+            <button on:click={() => {globalLosFilter = !globalLosFilter; globalLosiFilter = false; currentPage = 1;}} 
               class="px-6 rounded-2xl font-black text-[11px] tracking-wider transition-all {globalLosFilter ? 'bg-red-500 text-white shadow-[0_4px_14px_rgba(239,68,68,0.4)]' : (isDark ? 'bg-slate-800 text-slate-400 border border-slate-700 hover:bg-slate-700' : 'bg-white text-slate-500 border border-slate-200 hover:bg-slate-50')}">
               ТОЛЬКО LOS
+            </button>
+            <button on:click={() => {globalLosiFilter = !globalLosiFilter; globalLosFilter = false; currentPage = 1;}} 
+              class="px-6 rounded-2xl font-black text-[11px] tracking-wider transition-all {globalLosiFilter ? 'bg-fuchsia-500 text-white shadow-[0_4px_14px_rgba(217,70,239,0.4)]' : (isDark ? 'bg-slate-800 text-slate-400 border border-slate-700 hover:bg-slate-700' : 'bg-white text-slate-500 border border-slate-200 hover:bg-slate-50')}">
+              ТОЛЬКО LOSi
             </button>
           </div>
 
@@ -860,20 +940,23 @@ let ws;
             {#each paginatedPorts as port}
               {@const pOnus = port.onus}
               {@const strictLosCount = pOnus.filter(o => ['los', 'down'].includes((o.state||'').toLowerCase())).length}
+              {@const losiCount = pOnus.filter(o => (o.state||'').toLowerCase() === 'losi').length}
               
               <div class="rounded-2xl shrink-0 shadow-sm border overflow-hidden transition-colors {port.is_mass_outage ? (isDark ? 'border-red-900 bg-red-900/10' : 'border-red-300 bg-red-50') : (isDark ? 'bg-slate-800 border-slate-700' : 'bg-white border-slate-200')}">
-                <div class="flex items-center justify-between pr-4 cursor-pointer hover:opacity-80 transition-opacity" on:click={() => { activePort = activePort === port.name ? null : port.name; subFilter = globalLosFilter ? 'los' : 'all'; }}>
+                <div class="flex items-center justify-between pr-4 cursor-pointer hover:opacity-80 transition-opacity" on:click={() => { activePort = activePort === port.name ? null : port.name; subFilter = globalLosFilter ? 'los' : (globalLosiFilter ? 'losi' : 'all'); }}>
                   <div class="flex-1 flex items-center gap-6 p-4">
                     <span class="font-black w-16 text-lg {isDark ? 'text-slate-200' : 'text-slate-800'}">{port.name}</span>
                     {#if port.is_mass_outage}
                       <span class="px-3 py-1 text-[10px] font-black rounded-lg bg-red-500 text-white shadow-md animate-pulse uppercase tracking-widest">Авария порта</span>
                     {:else}
                       <div class="w-64 h-1.5 rounded-full overflow-hidden {isDark ? 'bg-slate-900' : 'bg-slate-100'}">
-                        <div class="bg-emerald-500 h-full" style="width: {((pOnus.length - strictLosCount)/pOnus.length)*100}%"></div>
+                        <div class="bg-emerald-500 h-full" style="width: {((pOnus.length - (strictLosCount + losiCount))/pOnus.length)*100}%"></div>
                       </div>
                     {/if}
-                    <div class="text-xs font-bold">
-                      <span class={strictLosCount > 0 ? 'text-red-500 drop-shadow-sm' : (isDark ? 'text-slate-500' : 'text-slate-400')}>{strictLosCount} LOS</span>
+                    <div class="text-xs font-bold flex gap-2">
+                      {#if strictLosCount > 0}<span class="text-red-500 drop-shadow-sm">{strictLosCount} LOS</span>{/if}
+                      {#if losiCount > 0}<span class="text-fuchsia-500 drop-shadow-sm">{losiCount} LOSi</span>{/if}
+                      {#if strictLosCount === 0 && losiCount === 0}<span class={isDark ? 'text-slate-500' : 'text-slate-400'}>0 проблем</span>{/if}
                       <span class="text-slate-400"> / {pOnus.length}</span>
                     </div>
                   </div>
@@ -887,7 +970,8 @@ let ws;
                       {#each [
                         {id: 'all', label: 'Все', count: pOnus.length},
                         {id: 'online', label: 'В сети', count: pOnus.filter(o => (o.state||'').toLowerCase() === 'working').length},
-                        {id: 'los', label: 'LOS / Down', count: strictLosCount},
+                        {id: 'los', label: 'LOS', count: strictLosCount},
+                        {id: 'losi', label: 'LOSi', count: losiCount},
                         {id: 'dying', label: 'DyingGasp', count: pOnus.filter(o => (o.state||'').toLowerCase() === 'dyinggasp').length},
                         {id: 'offline', label: 'Offline', count: pOnus.filter(o => (o.state||'').toLowerCase() === 'offline').length}
                       ] as filter}
@@ -906,6 +990,7 @@ let ws;
                         const s = (o.state || '').toLowerCase();
                         if (subFilter === 'online') return s === 'working';
                         if (subFilter === 'los') return ['los', 'down'].includes(s);
+                        if (subFilter === 'losi') return s === 'losi';
                         if (subFilter === 'dying') return s === 'dyinggasp';
                         if (subFilter === 'offline') return s === 'offline';
                         return true;
@@ -922,7 +1007,7 @@ let ws;
                           
                           <div class="flex justify-between items-end mt-2 pt-2 border-t {isDark ? 'border-slate-700' : 'border-slate-100'}">
                             <div class="text-[9px] font-black uppercase tracking-wider {getStatusColor(onu.state)}">{onu.state}</div>
-                            {#if (onu.state || '').toLowerCase() !== 'working' && onu.los_time}
+                            {#if !['working', 'host is alive'].includes((onu.state || '').toLowerCase()) && onu.los_time}
                               <div class="text-[9px] font-bold text-red-500">⏱ {formatLosTime(onu.los_time)}</div>
                             {/if}
                           </div>
