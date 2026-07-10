@@ -1,19 +1,25 @@
+# backend\main.py
 import asyncio
 import time
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 
-from config.inventory import OLT_LIST, SWITCH_LIST
-from config.settings import POLL_INTERVAL_SEC, MAX_WORKERS
+# ИСПРАВЛЕНО: Импортируем OLT_DEVICES вместо OLT_LIST
+from config.inventory import OLT_DEVICES, SWITCH_LIST
+from config.settings import POLL_INTERVAL_SEC
 from network.olt_client import fetch_all_onu
 from network.snmp_client import check_switch_snmp
-from utils.event_logger import log_switch_event, get_history, get_daily_stats_json, save_json_db, close_all_open_incidents
+from utils.event_logger import (
+    log_switch_event, 
+    log_onu_event, 
+    get_history, 
+    get_daily_stats_json, 
+    close_all_open_incidents
+)
 from ws_manager import ws_manager
 
-# ТЕПЕРЬ LOSI СЧИТАЕТСЯ АВАРИЕЙ СЕТИ ТАК ЖЕ, КАК LOS И DOWN
 LOS_STATES = {"LOS", "DOWN", "LOSI"}
 
 INTERNAL_STATE = {
@@ -27,7 +33,7 @@ INTERNAL_STATE = {
 
 GLOBAL_STATE = {"data": [], "next_update": 0, "is_updating": False}
 
-force_update_event = asyncio.Event()
+force_update_event = None
 
 def refresh_global_state():
     switches_node = {
@@ -49,8 +55,6 @@ def _track_events(olt_results: list) -> None:
         olt_ip = olt["ip"]
         for port in olt.get("ports", []):
             total_onus = len(port.get("onus", []))
-            
-            # В счетчик массовых аварий мы учитываем все виды обрывов
             strict_los_count = sum(1 for onu in port.get("onus", []) if onu["state"].upper() in LOS_STATES)
 
             for onu in port.get("onus", []):
@@ -66,8 +70,10 @@ def _track_events(olt_results: list) -> None:
 
                 if is_los and str(prev_state).upper() not in LOS_STATES:
                     los_start = now
+                    log_onu_event(key, "start")
                 elif not is_los and str(prev_state).upper() in LOS_STATES:
                     los_start = None
+                    log_onu_event(key, "end")
                 elif is_los and str(prev_state).upper() in LOS_STATES:
                     los_start = prev_data.get("los_start", now)
 
@@ -116,8 +122,6 @@ async def poll_switches_loop():
             curr_sw = {}
             folders_list = []
 
-            has_db_changes = False
-
             for name, onus in folders_dict.items():
                 total_sw = len(onus)
                 bad_sw = 0
@@ -140,14 +144,12 @@ async def poll_switches_loop():
                                 actual_down_state = True
                                 los_start = now
                                 log_switch_event(sw_id, "start")
-                                has_db_changes = True
                     else:
                         strikes = 0
                         if actual_down_state:
                             actual_down_state = False
                             los_start = None
                             log_switch_event(sw_id, "end")
-                            has_db_changes = True
 
                     if is_down_snmp and not actual_down_state:
                         sw["state"] = "working"
@@ -170,9 +172,6 @@ async def poll_switches_loop():
             INTERNAL_STATE["sw_results"] = folders_list
             refresh_global_state()
 
-            if has_db_changes:
-                await asyncio.to_thread(save_json_db)
-
             await ws_manager.broadcast({
                 "type": "update",
                 "data": GLOBAL_STATE["data"],
@@ -187,15 +186,15 @@ async def poll_switches_loop():
 
 
 async def poll_olt_loop():
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     while True:
         INTERNAL_STATE["is_updating_olt"] = True
         await ws_manager.broadcast({"type": "status", "is_updating": True})
 
         try:
-            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-                olt_tasks = [loop.run_in_executor(executor, fetch_all_onu, host) for host in OLT_LIST]
-                olt_results = list(await asyncio.gather(*olt_tasks))
+            # ИСПРАВЛЕНО: передаем конфигурационные словари из OLT_DEVICES
+            olt_tasks = [loop.run_in_executor(None, fetch_all_onu, device) for device in OLT_DEVICES]
+            olt_results = list(await asyncio.gather(*olt_tasks))
 
             await asyncio.to_thread(_track_events, olt_results)
             INTERNAL_STATE["olt_results"] = olt_results
@@ -224,7 +223,11 @@ async def poll_olt_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global force_update_event
+    force_update_event = asyncio.Event()
+    
     close_all_open_incidents()
+    
     olt_task = asyncio.create_task(poll_olt_loop())
     sw_task  = asyncio.create_task(poll_switches_loop())
     yield
@@ -257,9 +260,9 @@ async def get_contract_history(target_id: str, days: int = 30):
 
 @app.post("/api/update/force")
 async def trigger_force_update():
-    force_update_event.set()
+    if force_update_event:
+        force_update_event.set()
     return {"status": "ok", "message": "Update triggered"}
-
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):

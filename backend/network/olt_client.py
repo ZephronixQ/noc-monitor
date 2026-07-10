@@ -1,14 +1,18 @@
+# backend\network\olt_client.py
 import re
 from netmiko import ConnectHandler
 from collections import defaultdict
-from config.inventory import DEFAULT_USER, DEFAULT_PASS
 from utils.parser import parse_onu_line, RE_DESCRIPTION
 
-# Регулярка для извлечения Cause (опираемся только на строки с валидным годом 20xx)
+# Регулярка для извлечения Cause C300
 RE_CAUSE = re.compile(r'20\d{2}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+(LOSi|LOS)', re.IGNORECASE)
 
-def get_onu_details(conn, pon_port, onu_id, current_state):
-    """ Опрашивает детальную информацию, достает описание и настоящую причину (LOS / LOSi) """
+# Регулярка для извлечения договора (User-Defined-Rid) на C600
+RE_C600_RID = re.compile(r'User-Defined-Rid\s*:\s*(\S+)', re.IGNORECASE)
+
+
+def get_onu_details_c300(conn, pon_port, onu_id, current_state):
+    """Опрашивает детальную информацию для C300/C320, достает описание и причину LOS"""
     for iface in [f"gpon-onu_{pon_port}:{onu_id}", f"{pon_port}:{onu_id}"]:
         try:
             out = conn.send_command(f"show gpon onu detail-info {iface}", read_timeout=15)
@@ -20,10 +24,8 @@ def get_onu_details(conn, pon_port, onu_id, current_state):
             # Парсинг Cause
             cause = current_state
             if current_state.lower() in ["los", "down"]:
-                # Ищем все реальные отключения (игнорируем нули 0000-00-00)
                 causes = RE_CAUSE.findall(out)
                 if causes:
-                    # [-1] берет самый последний (свежий) записанный инцидент из таблицы
                     cause = causes[-1].upper() 
 
             return desc, cause
@@ -32,13 +34,35 @@ def get_onu_details(conn, pon_port, onu_id, current_state):
     return "—", current_state
 
 
-def fetch_all_onu(host):
+def get_onu_details_c600(conn, pon_port, onu_id):
+    """Опрашивает виртуальный порт vport на C600 и извлекает договор клиента"""
+    try:
+        cmd = f"show port-identification port vport-{pon_port}.1:{onu_id} service-port 1"
+        out = conn.send_command(cmd, read_timeout=15)
+        
+        m = RE_C600_RID.search(out)
+        desc = m.group(1) if m else "—"
+        return desc
+    except Exception as e:
+        print(f"❌ [C600] Ошибка парсинга vport {pon_port}:{onu_id}: {e}")
+        return "—"
+
+
+def fetch_all_onu(device_config: dict):
+    # ИСПРАВЛЕНО: Извлекаем параметры по ключу "asdzx1390" в соответствии с вашей конфигурацией
+    host = device_config["host"]
+    username = device_config["username"]
+    password = device_config["asdzx1390"]
+    port = device_config.get("port", 23)
+    model_type = device_config.get("type", "c300").lower()
+
     device = {
         "device_type": "zte_zxros_telnet",
         "host": host,
-        "username": DEFAULT_USER,
-        "password": DEFAULT_PASS,
-        "conn_timeout": 10,
+        "username": username,
+        "password": password,
+        "port": port,
+        "conn_timeout": 15,
     }
     try:
         conn = ConnectHandler(**device)
@@ -56,14 +80,17 @@ def fetch_all_onu(host):
         for pon_port, onus in ports.items():
             port_onus = []
             for onu_id, state in onus:
-                
                 safe_state = str(state).lower()
                 
-                if safe_state in ["los", "down"]:
-                    desc, actual_state = get_onu_details(conn, pon_port, onu_id, safe_state)
-                else:
-                    desc = "—" 
+                if model_type == "c600":
+                    desc = get_onu_details_c600(conn, pon_port, onu_id)
                     actual_state = state
+                else:
+                    if safe_state in ["los", "down"]:
+                        desc, actual_state = get_onu_details_c300(conn, pon_port, onu_id, safe_state)
+                    else:
+                        desc = "—" 
+                        actual_state = state
                 
                 port_onus.append({"id": f"{pon_port}:{onu_id}", "contract": desc, "state": actual_state})
             

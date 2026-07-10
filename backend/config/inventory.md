@@ -1,28 +1,71 @@
 ## Шаблон 'inventory.py'
 ```
 # ======================
-# Учетные данные
-# ======================
-DEFAULT_USER = "admin"
-DEFAULT_PASS = "password"
-
-# ======================
 # SNMP
 # ======================
 SNMP_COMMUNITY_RO = "public"
 SNMP_PORT = 161
 
 # ======================
-# OLT list
+# CONFIGURATION FOR OLT CLUSTER
 # ======================
-OLT_LIST = [
-    "192.11.2.12",
-    "192.11.2.13",
-    "192.11.2.14",
-    "192.11.2.16",
-    "192.11.2.17",
-    "192.11.2.18",
-    "192.11.2.19"
+OLT_DEVICES = [
+    {
+        "host": "192.168.2.11",
+        "username": "admin",
+        "password": "password-2026",
+        "port": 23,
+        "type": "c600"
+    },
+    {
+        "host": "192.168.2.12",
+        "username": "admin",
+        "password": "password",
+        "port": 23,
+        "type": "c300"
+    },
+    {
+        "host": "192.168.2.13",
+        "username": "admin",
+        "password": "password",
+        "port": 23,
+        "type": "c300"
+    },
+    {
+        "host": "192.168.2.14",
+        "username": "admin",
+        "password": "password",
+        "port": 23,
+        "type": "c300"
+    },
+    {
+        "host": "192.168.2.16",
+        "username": "admin",
+        "password": "password",
+        "port": 23,
+        "type": "c300"
+    },
+    {
+        "host": "192.168.2.17",
+        "username": "admin",
+        "password": "password",
+        "port": 23,
+        "type": "c300"
+    },
+    {
+        "host": "192.168.2.18",
+        "username": "admin",
+        "password": "password",
+        "port": 23,
+        "type": "c300"
+    },
+    {
+        "host": "192.168.2.19",
+        "username": "admin",
+        "password": "password",
+        "port": 23,
+        "type": "c300"
+    }
 ]
 
 # ======================

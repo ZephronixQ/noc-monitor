@@ -27,6 +27,7 @@ log/
 # Секретные данные
 backend/config/inventory.py
 backend/data/switches_history.json
+backend/data/noc_history.db
 
 # Настройки пользователя IDE
 .vscode/
