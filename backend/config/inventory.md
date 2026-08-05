@@ -1,6 +1,11 @@
 ## Шаблон 'inventory.py'
 ```
 # ======================
+# SECURITY & AUTHENTICATION
+# ======================
+ADMIN_PASSWORD_SECRET = "password2026"
+
+# ======================
 # SNMP
 # ======================
 SNMP_COMMUNITY_RO = "public"

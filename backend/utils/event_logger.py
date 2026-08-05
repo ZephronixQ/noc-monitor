@@ -1,16 +1,14 @@
-# backend\utils\event_logger.py
+# backend/utils/event_logger.py
 import os
 import sqlite3
 import time
 import threading
 from datetime import datetime
 
-# Путь к новой базе данных SQLite
 DB_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
 os.makedirs(DB_DIR, exist_ok=True)
 DB_PATH = os.path.join(DB_DIR, "noc_history.db")
 
-# Глобальная блокировка записи для предотвращения "database is locked" при параллельных запросах
 db_lock = threading.Lock()
 
 def init_db():
@@ -19,7 +17,6 @@ def init_db():
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         
-        # Таблица инцидентов падения связи
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS incidents (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -30,7 +27,6 @@ def init_db():
             )
         """)
         
-        # Создаем индексы для мгновенной выборки на больших объемах данных
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_incidents_target ON incidents (target_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_incidents_start ON incidents (start_time)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_incidents_end ON incidents (end_time)")
@@ -38,17 +34,15 @@ def init_db():
         conn.commit()
         conn.close()
 
-# Запуск инициализации бд при старте бэкенда
 init_db()
 
 def close_all_open_incidents():
-    """При перезапуске сервера закрываем все висящие (незакрытые) аварии текущим временем"""
+    """При перезапуске сервера закрываем все висящие аварии текущим временем"""
     now = int(time.time())
     with db_lock:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         
-        # Находим незакрытые сессии
         cursor.execute("SELECT target_id, start_time FROM incidents WHERE end_time IS NULL")
         open_cases = cursor.fetchall()
         
@@ -67,18 +61,15 @@ def close_all_open_incidents():
         conn.close()
 
 def log_event(target_id: str, action: str):
-    """
-    Универсальная потокобезопасная функция логирования событий для коммутаторов и ONU.
-    target_id: IP коммутатора или составной ONU_ID ("IP_OLT:Интерфейс:Индекс")
-    """
     now = int(time.time())
+    clean_target = target_id.strip().lower()
+    
     with db_lock:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         
         if action == "start":
-            # Проверяем, нет ли уже открытой аварии для этого узла
-            cursor.execute("SELECT id FROM incidents WHERE target_id = ? AND end_time IS NULL", (target_id,))
+            cursor.execute("SELECT id FROM incidents WHERE LOWER(target_id) = ? AND end_time IS NULL", (clean_target,))
             exists = cursor.fetchone()
             if not exists:
                 cursor.execute("""
@@ -88,43 +79,57 @@ def log_event(target_id: str, action: str):
                 conn.commit()
         
         elif action == "end":
-            # Закрываем аварийную сессию
             cursor.execute("""
                 UPDATE incidents
                 SET end_time = ?, duration = ? - start_time
-                WHERE target_id = ? AND end_time IS NULL
-            """, (now, now, target_id))
+                WHERE LOWER(target_id) = ? AND end_time IS NULL
+            """, (now, now, clean_target))
             conn.commit()
             
         conn.close()
 
 def log_switch_event(ip: str, action: str):
-    """Логирование коммутатора (алиас для обратной совместимости)"""
     log_event(ip, action)
 
 def log_onu_event(onu_id: str, action: str):
-    """Логирование GPON ONU"""
     log_event(onu_id, action)
 
 def get_history(target_id: str, days: int = 30) -> list:
-    """Извлечение истории инцидентов для конкретного хоста за последние N дней"""
+    """Гибкая извлекалка истории с поддержкой масок для ONU и OLT"""
     now = int(time.time())
     cutoff = now - (days * 86400)
     results = []
+    clean_target = target_id.strip().lower()
     
     with db_lock:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         
-        # Достаем инциденты, попадающие в выбранный диапазон дней
+        # 1. Прямой точный поиск (регистронезависимый)
         cursor.execute("""
             SELECT start_time, end_time, duration
             FROM incidents
-            WHERE target_id = ? AND (start_time >= ? OR end_time IS NULL)
+            WHERE LOWER(target_id) = ? AND (start_time >= ? OR end_time IS NULL)
             ORDER BY start_time DESC
-        """, (target_id, cutoff))
+        """, (clean_target, cutoff))
         
         rows = cursor.fetchall()
+        
+        # 2. Если точного совпадения нет и это ONU (есть двоеточия), ищем по маске IP и ID ONU
+        if not rows and ":" in clean_target:
+            parts = clean_target.split(":")
+            olt_ip = parts[0]
+            pure_onu = parts[-1]
+            pattern = f"{olt_ip}:%{pure_onu}"
+            
+            cursor.execute("""
+                SELECT start_time, end_time, duration
+                FROM incidents
+                WHERE LOWER(target_id) LIKE ? AND (start_time >= ? OR end_time IS NULL)
+                ORDER BY start_time DESC
+            """, (pattern, cutoff))
+            rows = cursor.fetchall()
+            
         conn.close()
         
     for start_time, end_time, duration in rows:
@@ -146,7 +151,6 @@ def get_history(target_id: str, days: int = 30) -> list:
     return results
 
 def get_daily_stats_json():
-    """Сбор статистики по авариям за последние 24 часа"""
     now = int(time.time())
     cutoff = now - 86400
     
@@ -154,18 +158,15 @@ def get_daily_stats_json():
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         
-        # 1. Всего аварий за 24 часа (активные + закрытые в эти сутки)
         cursor.execute("""
             SELECT COUNT(*) FROM incidents 
             WHERE start_time >= ? OR (end_time IS NULL OR end_time >= ?)
         """, (cutoff, cutoff))
         total_24h = cursor.fetchone()[0]
         
-        # 2. Активные аварии прямо сейчас
         cursor.execute("SELECT COUNT(*) FROM incidents WHERE end_time IS NULL")
         active_now = cursor.fetchone()[0]
         
-        # 3. Среднее время устранения (только закрытые инциденты за 24 часа)
         cursor.execute("""
             SELECT AVG(duration) FROM incidents 
             WHERE end_time >= ? AND start_time >= ? AND end_time IS NOT NULL
@@ -182,6 +183,5 @@ def get_daily_stats_json():
         "active_now": active_now
     }
 
-# Пустая функция-заглушка для совместимости, так как SQLite фиксирует изменения на лету и сохранение вручную больше не требуется
 def save_json_db():
     pass

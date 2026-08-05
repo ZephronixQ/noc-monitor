@@ -1,22 +1,29 @@
-# backend\main.py
+# backend/main.py
 import asyncio
 import time
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI, WebSocket, Request, HTTPException, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 
-# ИСПРАВЛЕНО: Импортируем OLT_DEVICES вместо OLT_LIST
 from config.inventory import OLT_DEVICES, SWITCH_LIST
 from config.settings import POLL_INTERVAL_SEC
 from network.olt_client import fetch_all_onu
 from network.snmp_client import check_switch_snmp
 from utils.event_logger import (
+    log_event,
     log_switch_event, 
     log_onu_event, 
     get_history, 
     get_daily_stats_json, 
     close_all_open_incidents
+)
+from utils.audit_engine import build_monthly_audit
+from utils.auth import (
+    get_daily_password, is_ip_blocked, register_failed_attempt, 
+    reset_ip_attempts, create_session_and_token, create_admin_token, verify_token_and_session, 
+    log_audit_action, get_all_sessions_and_bans, kill_session, ban_ip, unban_ip, 
+    clear_inactive_sessions, clear_audit_logs, ADMIN_PASSWORD_SECRET
 )
 from ws_manager import ws_manager
 
@@ -29,11 +36,36 @@ INTERNAL_STATE = {
     "is_updating_olt": False,
     "_prev_states": {},
     "_prev_sw_states": {},
+    "_prev_olt_states": {},
 }
 
 GLOBAL_STATE = {"data": [], "next_update": 0, "is_updating": False}
 
 force_update_event = None
+
+def get_client_ip(request: Request) -> str:
+    x_forwarded_for = request.headers.get("X-Forwarded-For")
+    if x_forwarded_for:
+        return x_forwarded_for.split(",")[0].strip()
+    return request.client.host if request.client else "127.0.0.1"
+
+async def require_auth(request: Request, authorization: str = Header(None)):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Требуется авторизация")
+    
+    token = authorization.split(" ")[1]
+    is_valid, msg = verify_token_and_session(token)
+    if not is_valid:
+        raise HTTPException(status_code=401, detail=msg)
+
+async def require_admin_auth(request: Request, authorization: str = Header(None)):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Требуются права администратора")
+    
+    token = authorization.split(" ")[1]
+    is_valid, msg = verify_token_and_session(token, require_admin=True)
+    if not is_valid:
+        raise HTTPException(status_code=403, detail=msg)
 
 def refresh_global_state():
     switches_node = {
@@ -48,12 +80,30 @@ def refresh_global_state():
 
 def _track_events(olt_results: list) -> None:
     prev = INTERNAL_STATE["_prev_states"]
+    prev_olts = INTERNAL_STATE.setdefault("_prev_olt_states", {})
     curr: dict[str, dict] = {}
+    curr_olts: dict[str, dict] = {}
     now = int(time.time())
 
     for olt in olt_results:
-        olt_ip = olt["ip"]
-        for port in olt.get("ports", []):
+        olt_ip = olt.get("ip")
+        if not olt_ip:
+            continue
+
+        ports = olt.get("ports", [])
+        total_onus_on_olt = sum(len(p.get("onus", [])) for p in ports)
+
+        is_olt_down = (len(ports) == 0) or olt.get("is_offline", False) or (total_onus_on_olt == 0 and len(ports) > 0)
+        was_olt_down = prev_olts.get(olt_ip, {}).get("is_down", False)
+
+        if is_olt_down and not was_olt_down:
+            log_event(olt_ip, "start")
+        elif not is_olt_down and was_olt_down:
+            log_event(olt_ip, "end")
+
+        curr_olts[olt_ip] = {"is_down": is_olt_down}
+
+        for port in ports:
             total_onus = len(port.get("onus", []))
             strict_los_count = sum(1 for onu in port.get("onus", []) if onu["state"].upper() in LOS_STATES)
 
@@ -89,6 +139,7 @@ def _track_events(olt_results: list) -> None:
                 port["is_mass_outage"] = False
 
     INTERNAL_STATE["_prev_states"] = curr
+    INTERNAL_STATE["_prev_olt_states"] = curr_olts
 
 
 async def process_single_switch(ip: str, desc: str, folder_name: str):
@@ -192,7 +243,6 @@ async def poll_olt_loop():
         await ws_manager.broadcast({"type": "status", "is_updating": True})
 
         try:
-            # ИСПРАВЛЕНО: передаем конфигурационные словари из OLT_DEVICES
             olt_tasks = [loop.run_in_executor(None, fetch_all_onu, device) for device in OLT_DEVICES]
             olt_results = list(await asyncio.gather(*olt_tasks))
 
@@ -238,19 +288,114 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
+# --- РУЧКИ АВТОРИЗАЦИИ И СЕССИЙ ---
 
-@app.get("/api/data")
+@app.post("/api/auth/login")
+async def login(request: Request, payload: dict):
+    ip = get_client_ip(request)
+    user_agent = request.headers.get("User-Agent", "Unknown")
+    
+    blocked, reason, rem_seconds = is_ip_blocked(ip)
+    if blocked:
+        raise HTTPException(status_code=403, detail=f"Вход заблокирован ({reason})")
+
+    password = payload.get("password", "").strip()
+    if password != get_daily_password():
+        res = register_failed_attempt(ip, max_attempts=3)
+        if res["is_blocked"]:
+            raise HTTPException(status_code=403, detail="3 ошибки! IP заблокирован на 24ч.")
+        raise HTTPException(status_code=400, detail=f"Неверный пароль! Осталось попыток: {res['remaining']}")
+
+    reset_ip_attempts(ip)
+    data = create_session_and_token(ip, user_agent)
+    log_audit_action(ip, f"Вход с сессией: {data['session_id'][:8]}...")
+    
+    return {"status": "ok", "token": data["token"], "session_id": data["session_id"]}
+
+
+@app.get("/api/auth/check", dependencies=[Depends(require_auth)])
+async def check_session_status():
+    return {"status": "active"}
+
+
+@app.post("/api/auth/admin-login")
+async def admin_login(request: Request, payload: dict):
+    ip = get_client_ip(request)
+    password = payload.get("password", "").strip()
+
+    if password == ADMIN_PASSWORD_SECRET:
+        unban_ip(ip)
+        reset_ip_attempts(ip)
+        admin_token = create_admin_token(ip)
+        log_audit_action(ip, "Успешный вход АДМИНА в /sessions")
+        return {"status": "ok", "admin_token": admin_token}
+
+    blocked, reason, rem_seconds = is_ip_blocked(ip)
+    if blocked:
+        raise HTTPException(status_code=403, detail=f"Вход заблокирован ({reason})")
+
+    res = register_failed_attempt(ip, max_attempts=7)
+    if res["is_blocked"]:
+        raise HTTPException(status_code=403, detail="7 ошибок ввода админ-пароля! IP заблокирован на 24ч.")
+    raise HTTPException(status_code=400, detail=f"Неверный секретный пароль! Осталось попыток: {res['remaining']}")
+
+
+# --- СЕКРЕТНЫЕ РУЧКИ УПРАВЛЕНИЯ СЕССИЯМИ ---
+
+@app.get("/api/admin/security", dependencies=[Depends(require_admin_auth)])
+async def get_security_dashboard():
+    return get_all_sessions_and_bans()
+
+@app.post("/api/admin/session/kill", dependencies=[Depends(require_admin_auth)])
+async def api_kill_session(request: Request, payload: dict):
+    ip = get_client_ip(request)
+    session_id = payload.get("session_id")
+    kill_session(session_id)
+    log_audit_action(ip, f"Принудительное закрытие сессии: {session_id[:8]}")
+    return {"status": "ok"}
+
+@app.post("/api/admin/ip/ban", dependencies=[Depends(require_admin_auth)])
+async def api_ban_ip(request: Request, payload: dict):
+    admin_ip = get_client_ip(request)
+    target_ip = payload.get("ip")
+    reason = payload.get("reason", "Заблокирован админом")
+    
+    ban_ip(target_ip, ban_type="permanent", hours=0, reason=reason)
+    log_audit_action(admin_ip, f"Перманентная блокировка IP {target_ip}")
+    return {"status": "ok"}
+
+@app.post("/api/admin/ip/unban", dependencies=[Depends(require_admin_auth)])
+async def api_unban_ip(request: Request, payload: dict):
+    admin_ip = get_client_ip(request)
+    target_ip = payload.get("ip")
+    unban_ip(target_ip)
+    log_audit_action(admin_ip, f"Разблокировка IP {target_ip}")
+    return {"status": "ok"}
+
+@app.post("/api/admin/sessions/clear-inactive", dependencies=[Depends(require_admin_auth)])
+async def api_clear_inactive_sessions(request: Request):
+    ip = get_client_ip(request)
+    clear_inactive_sessions()
+    log_audit_action(ip, "Очистка выбитых и неактивных сессий")
+    return {"status": "ok"}
+
+@app.post("/api/admin/logs/clear", dependencies=[Depends(require_admin_auth)])
+async def api_clear_audit_logs(request: Request):
+    ip = get_client_ip(request)
+    clear_audit_logs()
+    log_audit_action(ip, "Очистка логов аудита")
+    return {"status": "ok"}
+
+@app.get("/api/data", dependencies=[Depends(require_auth)])
 async def get_initial_data():
     refresh_global_state()
     return GLOBAL_STATE
 
-
-@app.get("/api/stats/daily")
+@app.get("/api/stats/daily", dependencies=[Depends(require_auth)])
 async def get_daily_stats():
     return get_daily_stats_json()
 
-
-@app.get("/api/history/{target_id:path}")
+@app.get("/api/history/{target_id:path}", dependencies=[Depends(require_auth)])
 async def get_contract_history(target_id: str, days: int = 30):
     try:
         history = get_history(target_id, days)
@@ -258,11 +403,21 @@ async def get_contract_history(target_id: str, days: int = 30):
     except Exception as e:
         return {"target_id": target_id, "days": days, "incidents": [], "error": str(e)}
 
-@app.post("/api/update/force")
-async def trigger_force_update():
+@app.get("/api/audit/month", dependencies=[Depends(require_auth)])
+async def get_audit_month(year: int, month: int, day: int = 1, shift: str = "night"):
+    try:
+        return build_monthly_audit(year, month, day, shift, INTERNAL_STATE)
+    except Exception as e:
+        print(f"❌ [AUDIT ERROR]: {e}")
+        return {"error": str(e), "calendar_days": [], "switches": [], "gpon": []}
+
+@app.post("/api/update/force", dependencies=[Depends(require_auth)])
+async def trigger_force_update(request: Request):
+    ip = get_client_ip(request)
+    log_audit_action(ip, "Запуск ПРИНУДИТЕЛЬНОГО сканирования сети")
     if force_update_event:
         force_update_event.set()
-    return {"status": "ok", "message": "Update triggered"}
+    return {"status": "ok", "message": "Update triggered", "operator_ip": ip}
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):

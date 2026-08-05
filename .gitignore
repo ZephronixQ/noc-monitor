@@ -25,9 +25,13 @@ log/
 # Конфигурации
 # ======================
 # Секретные данные
+# Секретные конфигурации и базы данных
 backend/config/inventory.py
-backend/data/switches_history.json
-backend/data/noc_history.db
+backend/data/*.db
+backend/data/*.json
+backend/data/
+*.db
+*.sqlite
 
 # Настройки пользователя IDE
 .vscode/
