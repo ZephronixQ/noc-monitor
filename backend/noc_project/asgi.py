@@ -1,18 +1,19 @@
 import os
 import django
+from pathlib import Path
+from contextlib import asynccontextmanager
 
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "noc_project.settings")
 django.setup()
 
 import asyncio
-from pathlib import Path
-from contextlib import asynccontextmanager
-
 from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.wsgi import WSGIMiddleware
 from django.core.wsgi import get_wsgi_application
+from django.contrib.auth.models import User
+from asgiref.sync import sync_to_async
 
 from noc_project.ws import ws_manager
 from inventory.views_auth import auth_router
@@ -26,6 +27,27 @@ from poller.engine import (
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    @sync_to_async
+    def sync_admin_user():
+        admin_user = os.getenv("DJANGO_ADMIN_USER", "admin")
+        admin_pass = os.getenv("DJANGO_ADMIN_PASSWORD", "admin2026")
+
+        user, created = User.objects.get_or_create(
+            username=admin_user, 
+            defaults={"email": "admin@noc.local", "is_staff": True, "is_superuser": True}
+        )
+        user.is_active = True
+        user.is_staff = True
+        user.is_superuser = True
+        user.set_password(admin_pass)
+        user.save()
+        if created:
+            print(f"✨ [AUTH] Создан новый суперпользователь: '{admin_user}'")
+        else:
+            print(f"🔄 [AUTH] Пароль пользователя '{admin_user}' успешно обновлен из .env")
+
+    await sync_admin_user()
+
     refresh_global_state()
 
     sw_task = asyncio.create_task(poll_switches_loop(ws_manager.broadcast))

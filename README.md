@@ -15,7 +15,7 @@
 ## Демонстрация интерфейса
 
 <div align="center">
-  <img width="1919" height="1079" alt="Image" src="https://github.com/user-attachments/assets/3e4d25e9-02ed-46bf-9d23-8935dbe900cb" />
+  <img width="1919" height="1079" alt="NOC Monitor Live Demo" src="https://github.com/user-attachments/assets/3e4d25e9-02ed-46bf-9d23-8935dbe900cb" />
 </div>
 
 ---
@@ -72,19 +72,27 @@ cd noc-monitor
 ```
 
 ### 2. Настройка переменных окружения
-Скопируйте конфигурационный файл и настройте параметры под вашу сеть:
+Скопируйте конфигурационный файл-шаблон:
 ```bash
 cp backend/.env.example backend/.env
 ```
 
-Содержимое `backend/.env`:
+Для генерации криптографически стойкого секрета Django/JWT выполните команду:
+```bash
+python3 -c "import secrets; print(secrets.token_urlsafe(50))"
+```
+
+Вставьте полученный ключ в строку `DJANGO_SECRET_KEY` и настройте учетные данные:
 ```ini
 SNMP_COMMUNITY=public
 SNMP_PORT=161
 
+# Учетные данные суперпользователя (при первом старте создаются автоматически)
 DJANGO_ADMIN_USER=admin
 DJANGO_ADMIN_PASSWORD=your_secure_password
-DJANGO_SECRET_KEY=generate_random_secret_key_here
+
+# Сгенерированный секретный ключ
+DJANGO_SECRET_KEY=m8vKx9_Q2wL4nP1zY7rT6sD0fG5hJ3kL8mNpQrStUvWxYzAbCdEfGhIjKlMn
 ```
 
 ### 3. Запуск контейнеров
@@ -95,7 +103,7 @@ docker compose up -d --build
 После завершения сборки:
 - **Основной интерфейс мониторинга:** `http://localhost`
 - **Панель управления сетевым оборудованием:** `http://localhost/admin`
-- Учётные данные по умолчанию: логин и пароль из вашего файла `.env` (при первом запуске создаются автоматически).
+- Учётные данные по умолчанию: логин и пароль, указанные вами в файле `backend/.env`.
 
 ---
 
