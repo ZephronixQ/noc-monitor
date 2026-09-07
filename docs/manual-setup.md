@@ -1,23 +1,24 @@
-# Запуск noc-monitor
+# Запуск noc-monitor v5.0.0
 
-> Поддерживаются два режима запуска: **Docker** (рекомендуется) и **ручной**.  
-> Актуально для **Windows 11 WSL** и **Linux Debian/Ubuntu**.
+> Поддерживаются два режима запуска: **Docker Compose** (основной для продакшна) и **ручной запуск** (для локальной разработки).  
+> Актуально для **Windows 11 (WSL2 Debian/Ubuntu)** и **серверов Linux (Debian 12/13, Ubuntu 22.04/24.04)**.
 
 ---
 
 ## Содержание
 
-- [1. Установка WSL и Debian (только для Windows)](#1-установка-wsl-и-debian-только-для-windows)
-- [2. Подготовка системы](#2-подготовка-системы)
+- [1. Подготовка окружения (только для Windows WSL)](#1-подготовка-окружения-только-для-windows-wsl)
+- [2. Системные пакеты и зависимости](#2-системные-пакеты-и-зависимости)
 - [3. Настройка MIB-файлов (SNMP)](#3-настройка-mib-файлов-snmp)
-- [4. Клонирование и конфигурация](#4-клонирование-и-конфигурация)
-- [🐳 Запуск через Docker (рекомендуется)](#-запуск-через-docker-рекомендуется)
-- [⚙️ Ручной запуск](#️-ручной-запуск)
-- [Замечания](#замечания)
+- [4. Клонирование и настройка конфигурации (.env)](#4-клонирование-и-настройка-конфигурации-env)
+- [🐳 Запуск через Docker Compose (Рекомендуется)](#-запуск-через-docker-compose-рекомендуется)
+- [⚙️ Ручной запуск для разработки](#️-ручной-запуск-для-разработки)
+- [Наполнение инвентаря через Django Admin](#наполнение-инвентаря-через-django-admin)
+- [Диагностика и решение проблем](#диагностика-и-решение-проблем)
 
 ---
 
-## 1. Установка WSL и Debian (только для Windows)
+## 1. Подготовка окружения (только для Windows WSL)
 
 Откройте PowerShell **от имени администратора**:
 
@@ -25,7 +26,7 @@
 wsl --install Debian
 ```
 
-> ⚠️ После установки потребуется перезагрузка. Затем запустите WSL:
+> ⚠️ После установки перезагрузите компьютер и войдите в WSL:
 
 ```powershell
 wsl
@@ -33,11 +34,13 @@ wsl
 
 ---
 
-## 2. Подготовка системы
+## 2. Системные пакеты и зависимости
+
+Выполните установку базовых утилит и пакетов для сборки:
 
 ```bash
 sudo apt update
-sudo apt install -y snmp wget git python3-venv
+sudo apt install -y snmp wget git python3-venv python3-pip nodejs npm iputils-ping
 ```
 
 ---
@@ -47,28 +50,26 @@ sudo apt install -y snmp wget git python3-venv
 ### 3.1 Установка через пакетный менеджер
 
 ```bash
-sudo apt install snmp-mibs-downloader
+sudo apt install -y snmp-mibs-downloader
 sudo download-mibs
 ```
 
-> ⚠️ На Debian 13 (trixie) пакет может отсутствовать — выполните шаг 3.2.
-
-### 3.2 Если пакет недоступен — добавьте репозиторий non-free
+> ⚠️ Если в репозитории Debian пакета нет, включите компоненты `contrib` и `non-free`:
 
 ```bash
 sudo sed -i 's/main/main contrib non-free non-free-firmware/' /etc/apt/sources.list
 sudo apt update
-sudo apt install snmp-mibs-downloader
+sudo apt install -y snmp-mibs-downloader
 ```
 
-### 3.3 Создать конфиг SNMP
+### 3.2 Создание конфигурационного файла SNMP
 
 ```bash
 mkdir -p ~/.snmp
 echo "mibs +ALL" >> ~/.snmp/snmp.conf
 ```
 
-### 3.4 Если пакет так и не установился — скачать MIB-файлы вручную
+### 3.3 Ручная загрузка MIB-файлов (если пакет недоступен)
 
 ```bash
 cd /usr/share/snmp/mibs
@@ -84,95 +85,78 @@ sudo wget -q https://raw.githubusercontent.com/net-snmp/net-snmp/master/mibs/SNM
 sudo wget -q https://raw.githubusercontent.com/net-snmp/net-snmp/master/mibs/INET-ADDRESS-MIB.txt
 ```
 
-### 3.5 Исправить битый файл SNMPv2-PDU
+### 3.4 Проверка работы SNMP
 
 ```bash
-sudo rm /usr/share/snmp/mibs/ietf/SNMPv2-PDU
-sudo wget -q -O /usr/share/snmp/mibs/ietf/SNMPv2-PDU \
-  https://raw.githubusercontent.com/net-snmp/net-snmp/master/mibs/SNMPv2-PDU.txt
-```
-
-### 3.6 Проверка SNMP
-
-```bash
-snmpwalk -v2c -c public <IP> sysDescr
-snmpget -v2c -c public <IP> IF-MIB::ifOperStatus.2
+snmpwalk -v2c -c public <IP_КОММУТАТОРА> sysDescr
 ```
 
 ---
 
-## 4. Клонирование и конфигурация
+## 4. Клонирование и настройка конфигурации (.env)
+
+Клонируйте репозиторий в рабочую директорию:
 
 ```bash
-git clone https://github.com/ZephronixQ/noc-monitor.git
-cd noc-monitor
+cd /opt
+sudo git clone https://github.com/ZephronixQ/noc-monitor.git
+sudo chown -R $USER:$USER /opt/noc-monitor
+cd /opt/noc-monitor
 ```
 
-Создайте файл `backend/config/inventory.py` и укажите в нём адреса устройств, учётные данные и SNMP community:
+Создайте рабочий файл переменных окружения:
 
-```python
-# Список OLT (ZTE)
-OLT_LIST = ["192.168.1.10", "192.168.1.11"]
-
-# Список коммутаторов (SNMP)
-SWITCH_LIST = ["192.168.1.20", "192.168.1.21"]
-
-# Учётные данные OLT
-DEFAULT_USER = "admin"
-DEFAULT_PASS = "password"
-
-# SNMP
-SNMP_COMMUNITY_RO = "public"
-SNMP_PORT = 161
+```bash
+cp backend/.env.example backend/.env
 ```
 
-> ⚠️ Файл с реальными данными добавлен в `.gitignore` и не публикуется в репозитории.
+Отредактируйте параметры в `backend/.env`:
 
-При необходимости скорректируйте параметры опроса в `backend/config/settings.py`:
+```ini
+# SNMP параметры опроса по умолчанию
+SNMP_COMMUNITY=public
+SNMP_PORT=161
 
-```python
-MAX_WORKERS = 10          # Число параллельных Telnet-потоков
-POLL_INTERVAL_SEC = 1800  # Интервал опроса (секунды), по умолчанию 30 минут
+# Учетные данные суперпользователя Django (создается автоматически)
+DJANGO_ADMIN_USER=admin
+DJANGO_ADMIN_PASSWORD=change_this_password_2026
+
+# Секретный ключ подписи Django и JWT-токенов
+DJANGO_SECRET_KEY=k8f#m2@9!x_generate_random_secret_key_here
 ```
+
+> ⚠️ В версии **v5.0.0** статический файл `inventory.py` больше не используется. Все устройства добавляются через базу данных и панель Django Admin.
 
 ---
 
-## 🐳 Запуск через Docker (рекомендуется)
+## 🐳 Запуск через Docker Compose (Рекомендуется)
 
-Docker-режим не требует ручной установки Python, Node.js и зависимостей. Всё запускается в изолированных контейнерах и поднимается автоматически при старте Windows.
+Docker-сборка изолирует все компоненты, запускает ASGI-сервер бэкенда, собирает клиентский Svelte-код и конфигурирует Nginx в качестве единого reverse proxy на 80 порту.
 
-### Включить Systemd в WSL
-
-Без этого Docker не запустится автоматически при старте WSL:
+### Включение Systemd в WSL (для Windows)
 
 ```bash
 sudo nano /etc/wsl.conf
 ```
 
-Вставить:
+Вставьте блок:
 
 ```ini
 [boot]
 systemd=true
 ```
 
-Сохранить (`Ctrl+O`, `Enter`, `Ctrl+X`), перезапустить WSL из PowerShell (от администратора):
+Сохраните изменения (`Ctrl+O`, `Enter`, `Ctrl+X`) и перезапустите WSL из PowerShell (от имени администратора):
 
 ```powershell
 wsl --shutdown
 ```
 
-### Установка Docker в Debian
-
-> Не устанавливайте Docker Desktop для Windows — используйте нативный Docker внутри WSL/Debian.
+### Установка Docker в Debian/Ubuntu
 
 ```bash
-# Удалить старые версии (если были)
-sudo apt-get remove docker docker-engine docker.io containerd runc
-
-# Установить зависимости и добавить репозиторий Docker
 sudo apt-get update
-sudo apt-get install ca-certificates curl gnupg
+sudo apt-get install -y ca-certificates curl gnupg
 sudo install -m 0755 -d /etc/apt/keyrings
 curl -fsSL https://download.docker.com/linux/debian/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
 sudo chmod a+r /etc/apt/keyrings/docker.gpg
@@ -182,143 +166,120 @@ echo \
   "$(. /etc/os-release && echo "$VERSION_CODENAME")" stable" | \
   sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
 
-# Установить Docker
 sudo apt-get update
-sudo apt-get install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 
-# Добавить в автозагрузку внутри Debian
 sudo systemctl enable docker
-
-# Добавить текущего пользователя в группу docker (чтобы не писать sudo)
 sudo usermod -aG docker $USER
 newgrp docker
 ```
 
-### Развернуть проект
-
-Проект должен находиться в Linux-файловой системе, а не на Windows-диске (`/mnt/c/...`) — иначе Docker работает нестабильно из-за различий в правах доступа.
+### Сборка и запуск контейнеров
 
 ```bash
-# Создать директорию в Linux-файловой системе
-sudo mkdir -p /opt/noc-monitor
-sudo chown $USER:$USER /opt/noc-monitor
-
-# Определение пути нынешнего проекта 'noc-monitor'
-pwd
-
-# Скопировать файлы (если проект лежит на Windows-диске)
-cp -r /mnt/c/Users/USER/noc-monitor/* /opt/noc-monitor/
-
 cd /opt/noc-monitor
-
-# Собрать и запустить контейнеры
 docker compose up -d --build
 ```
 
-> ⏳ Первая сборка занимает 15–20 минут — Docker скачивает образы и компилирует зависимости. Последующие запуски занимают несколько секунд благодаря кэшу слоёв.
+При старте контейнер `noc-backend`:
+1. Автоматически применит все миграции Django в базу `./backend/data/noc_database.sqlite3`.
+2. Создаст суперпользователя `admin` с паролем из файла `.env`.
+3. Запустит фоновые циклы опроса коммутаторов и станций OLT.
 
-Проверить состояние контейнеров:
-
-```bash
-docker ps
-```
-
-Ожидаемый вывод:
-
-```
-CONTAINER ID   NAME           STATUS         PORTS
-xxxxxxxxxxxx   noc-frontend   Up X minutes   0.0.0.0:80->80/tcp
-xxxxxxxxxxxx   noc-backend    Up X minutes   0.0.0.0:8000->8000/tcp
-```
-
-Интерфейс доступен по адресу: **http://localhost**
-
-### Автозапуск вместе с Windows
-
-Открой **PowerShell от имени администратора** и выполни:
-```powershell
-$trigger1 = New-ScheduledTaskTrigger -AtStartup
-$trigger1.Delay = "PT10S"
-
-$trigger2 = New-ScheduledTaskTrigger -AtStartup
-$trigger2.Delay = "PT30S"
-
-# Задача 1: удерживает WSL живым в фоне (запускается через 10 сек после старта)
-$action1 = New-ScheduledTaskAction -Execute "powershell.exe" -Argument '-WindowStyle Hidden -Command "wsl -d Debian -u root -e bash -c ''while true; do sleep 60; done''"'
-Register-ScheduledTask -TaskName "WSL_KeepAlive" -Action $action1 -Trigger $trigger1 -Settings (New-ScheduledTaskSettingsSet -Hidden -ExecutionTimeLimit 0) -RunLevel Highest -User "$env:USERDOMAIN\$env:USERNAME"
-
-# Задача 2: запуск Docker (запускается через 30 сек, когда WSL уже живой)
-$action2 = New-ScheduledTaskAction -Execute "powershell.exe" -Argument '-WindowStyle Hidden -Command "wsl -d Debian -u root -e bash -c ''service docker start && cd /opt/noc-monitor && docker compose up -d''"'
-Register-ScheduledTask -TaskName "NOC_Autostart" -Action $action2 -Trigger $trigger2 -Settings (New-ScheduledTaskSettingsSet -Hidden) -RunLevel Highest -User "$env:USERDOMAIN\$env:USERNAME"
-```
-
-Проверить созданные задачи:
-```powershell
-Get-ScheduledTask -TaskName "NOC_Autostart"
-Get-ScheduledTask -TaskName "WSL_KeepAlive"
-```
-
-### Управление контейнерами
+Проверьте статус контейнеров:
 
 ```bash
-# Перезапустить после изменений в коде
-docker compose up -d --build
-
-# Пересобрать только один сервис
-docker compose up -d --build backend
-
-# Остановить всё
-docker compose down
-
-# Пересобрать без кэша (если изменения не применяются)
-docker compose down
-docker compose build --no-cache backend
-docker compose up -d
-
-# Применить изменение в одном файле без пересборки
-docker cp backend/network/olt_client.py noc-backend:/app/backend/network/olt_client.py
-docker restart noc-backend
-
-# Логи в реальном времени
-docker compose logs -f
-docker logs noc-backend
-docker logs noc-frontend
+docker compose ps
 ```
+
+Ожидаемый результат:
+
+```text
+NAME           IMAGE                  COMMAND                  SERVICE    STATUS      PORTS
+noc-backend    noc-monitor-backend    "sh -c 'python manag…"   backend    running     8000/tcp
+noc-frontend   noc-monitor-frontend   "/docker-entrypoint.…"   frontend   running     0.0.0.0:80->80/tcp
+```
+
+* **Веб-интерфейс мониторинга:** `http://localhost`
+* **Панель управления инвентарем:** `http://localhost/admin`
 
 ---
 
-## ⚙️ Ручной запуск
+## ⚙️ Ручной запуск для разработки
 
-Альтернатива Docker — запуск напрямую через Python и Node.js. Удобно для разработки.
+Используется для внесения правок в код без необходимости пересобирать Docker-образы.
 
-### Запуск Backend
+### 1. Запуск Backend
 
 ```bash
-python3 -m venv venv && source venv/bin/activate
+cd /opt/noc-monitor/backend
+python3 -m venv venv
+source venv/bin/activate
 pip install -r requirements.txt
-python3 backend/main.py
+
+# Создание структуры БД и миграции
+python manage.py migrate
+
+# Создание суперпользователя вручную
+python manage.py createsuperuser
+
+# Запуск единого ASGI-сервера
+python -m uvicorn noc_project.asgi:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-### Запуск Frontend
+### 2. Запуск Frontend
+
+В отдельном окне терминала:
 
 ```bash
-cd frontend
+cd /opt/noc-monitor/frontend
 npm install
 npm run dev
 ```
 
-Интерфейс доступен по адресу: `http://localhost:5173`
+Интерфейс разработчика будет доступен по адресу: `http://localhost:5173`.
 
 ---
 
-## Замечания
+## Наполнение инвентаря через Django Admin
 
-- `public` — только чтение (RO)
-- При `Timeout` во время SNMP-опроса — проверьте community-строку в `inventory.py`
-- Не отключайте порт, через который идёт SNMP-опрос — устройство перестанет отвечать
-- На Debian 13 (trixie) `snmp-mibs-downloader` может отсутствовать — используйте раздел 3.4
-- Проект должен лежать в `/opt/noc-monitor`, а не в `/mnt/c/` — Docker работает нестабильно с Windows-дисками
+После первого запуска система готова к внесению оборудования:
+
+1. Откройте в браузере: `http://localhost/admin`
+2. Войдите под учетной записью администратора (`admin` и пароль из `.env`).
+3. Заполните сущности:
+   * **Локации / Папки (`Clusters`):** Добавьте группы (например: `Мкр. Центральный`, `Дом 14`, `Северный узел`).
+   * **Коммутаторы (`Switches`):** Добавьте устройства, укажите IP, текстовое описание (адрес/подъезд), выберите локацию. При необходимости укажите модель в поле `model_override`.
+   * **Станции OLT (`Olt Devices`):** Укажите IP станции, порт (по умолчанию `23`), реквизиты доступа Telnet и выберите архитектуру шасси (`ZTE C300/C320` или `ZTE C600/C650`).
+
+> ℹ️ Поллеры автоматически подхватывают добавленные и измененные устройства в реальном времени без перезапуска сервисов.
 
 ---
 
-*Протестировано на Windows 11 + WSL + Debian GNU/Linux 13 (trixie) — 07.04.2026*
+## Диагностика и решение проблем
+
+### Просмотр логов в реальном времени
+
+```bash
+# Логи бэкенда и фоновых поллеров (SNMP, Telnet, Django)
+docker logs -f noc-backend
+
+# Логи веб-сервера Nginx
+docker logs -f noc-frontend
+```
+
+### Ошибка 401 Unauthorized в интерфейсе
+
+Сессия оператора хранится в LocalStorage в течение 365 дней. Если вы изменили ключ `DJANGO_SECRET_KEY` в `.env`, существующие токены станут недействительными:
+1. Выполните логаут через правый верхний угол интерфейса (иконка выхода).
+2. Авторизуйтесь заново под учетной записью из Django Admin.
+
+### Пересоздание контейнеров с нуля с сохранением истории
+
+База данных и инвентарь хранятся на хосте в папке `./backend/data`. Вы можете безопасно пересобирать образы:
+
+```bash
+docker compose down
+docker compose build --no-cache
+docker compose up -d
+```

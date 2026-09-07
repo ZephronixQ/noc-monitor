@@ -16,6 +16,7 @@ class ConnectionManager:
         for connection in self.active_connections:
             try:
                 await connection.send_json(message)
-            except: pass
+            except Exception:
+                pass
 
 ws_manager = ConnectionManager()

@@ -1,7 +1,7 @@
 <!-- frontend/src/components/common/HistoryModal.svelte -->
 <script>
   import { fade, scale, slide } from 'svelte/transition';
-  import { createEventDispatcher } from 'svelte';
+  import { createEventDispatcher, onMount } from 'svelte';
 
   export let isDark = false;
   export let selectedEntity = null;
@@ -12,46 +12,66 @@
   let expandedEventKey = null;
   let timeFilter = 'all';
 
-  function close() { dispatch('close'); }
+  function close() { 
+    dispatch('close'); 
+  }
 
   function toggleExpand(key) {
     expandedEventKey = expandedEventKey === key ? null : key;
   }
 
-  // Универсальный и надежный парсер заголовка модального окна
-  $: parsedHeader = (() => {
-    if (!selectedEntity?.contract) return { title: '—', subtitle: '', details: [] };
-    const contract = selectedEntity.contract.trim();
-    const type = selectedEntity.type || 'sw';
-    const id = selectedEntity.id || '';
+  // ЖЕСТКИЙ ПЕРЕХВАТ ESC: закрывает ТОЛЬКО историю и глушит событие для фона
+  function handleKeyDown(e) {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation();
+      e.stopImmediatePropagation();
+      close();
+    }
+  }
 
-    if (type === 'olt' || contract.startsWith('OLT Станция')) {
+  onMount(() => {
+    // capture: true перехватывает нажатие ДО того, как оно долетит до тулбаров
+    window.addEventListener('keydown', handleKeyDown, true);
+    return () => window.removeEventListener('keydown', handleKeyDown, true);
+  });
+
+  // Надежный парсер метаданных
+  $: parsedHeader = (() => {
+    if (!selectedEntity) return { title: 'Узел сети', subtitle: '', typeTag: 'УЗЕЛ' };
+    
+    const contract = (selectedEntity.contract || selectedEntity.name || selectedEntity.title || '').trim();
+    const type = (selectedEntity.type || '').toLowerCase();
+    const id = selectedEntity.id || selectedEntity.ip || '';
+
+    if (type === 'olt' || contract.startsWith('OLT') || (id.startsWith('172.31.') && (contract.includes('OLT') || !contract))) {
       return {
-        title: contract,
-        subtitle: `IP-адрес станции: ${id}`,
-        typeTag: 'OLT СТАНЦИЯ'
+        title: contract || `OLT Станция ${id}`,
+        subtitle: `Головная станция GPON · ${id}`,
+        typeTag: 'OLT СТАНЦИЯ',
+        ip: id
       };
     }
 
-    if (type === 'sw') {
+    if (type === 'sw' || selectedEntity.isSwitch || id.includes('172.31.')) {
       const parts = contract.split('|');
-      const address = parts[0] ? parts[0].trim() : contract;
+      const address = parts[0] ? parts[0].trim() : (contract || id);
       const model = parts[1] ? parts[1].trim() : '';
       return {
         title: address,
-        subtitle: model ? `Модель: ${model}` : '',
-        typeTag: 'КОММУТАТОР',
+        subtitle: model ? `Модель: ${model}` : (selectedEntity.folderName ? `Кластер: ${selectedEntity.folderName}` : ''),
+        typeTag: 'КОММУТАТОР L2/L3',
         ip: id
       };
     }
 
     // ONU
     const parts = contract.split('|');
-    const address = parts[0] ? parts[0].trim() : contract;
+    const address = parts[0] ? parts[0].trim() : (contract || `ONU #${id}`);
     const onuDetails = parts[1] ? parts[1].trim() : '';
     return {
       title: address,
-      subtitle: onuDetails,
+      subtitle: onuDetails || (id ? `Интерфейс: ${id}` : ''),
       typeTag: 'GPON ONU',
       ip: id
     };
@@ -85,14 +105,14 @@
 
   $: counts = (() => {
     let morning = 0; let day = 0; let evening = 0; let night = 0;
-    entityHistory.forEach(event => {
+    (entityHistory || []).forEach(event => {
       const cat = getTimeCategory(event.start_human);
       if (cat === 'morning') morning++;
       else if (cat === 'day') day++;
       else if (cat === 'evening') evening++;
       else if (cat === 'night') night++;
     });
-    return { all: entityHistory.length, morning, day, evening, night };
+    return { all: (entityHistory || []).length, morning, day, evening, night };
   })();
 
   function clusterOutages(rawHistory) {
@@ -139,61 +159,74 @@
     }).reverse();
   }
 
-  $: enrichedHistory = clusterOutages(entityHistory.filter(e => timeFilter === 'all' || getTimeCategory(e.start_human) === timeFilter));
+  $: enrichedHistory = clusterOutages((entityHistory || []).filter(e => timeFilter === 'all' || getTimeCategory(e.start_human) === timeFilter));
 </script>
 
-<div class="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-slate-950/75 backdrop-blur-md font-sans" in:fade={{duration: 180}} out:fade={{duration: 150}}>
-  
-  <div class="w-full max-w-2xl rounded-3xl shadow-2xl overflow-hidden flex flex-col max-h-[85vh] border backdrop-blur-2xl transition-colors
-    {isDark ? 'bg-[#1e2a40] border-slate-700/70 text-slate-100' : 'bg-white border-slate-200 text-slate-900'}" 
-    in:scale={{start: 0.95, duration: 180}}
+<!-- BACKDROP ОВЕРЛЕЙ -->
+<div 
+  on:click|self={close}
+  class="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-slate-950/75 backdrop-blur-md font-sans select-none" 
+  in:fade={{duration: 120}} 
+  out:fade={{duration: 100}}
+>
+  <!-- ОСНОВНОЙ КОНТЕЙНЕР ОКНА -->
+  <div 
+    on:click|stopPropagation
+    class="w-full max-w-2xl rounded-3xl shadow-2xl overflow-hidden flex flex-col h-[82vh] max-h-[720px] border transition-all
+    {isDark ? 'bg-[#1b2537] border-slate-700/70 text-slate-100 shadow-black/80' : 'bg-white border-slate-200 text-slate-900 shadow-2xl'}" 
+    in:scale={{start: 0.96, duration: 150}}
   >
-    <!-- Шапка модального окна -->
-    <div class="px-7 py-5 border-b flex justify-between items-start gap-4 relative overflow-hidden
-      {isDark ? 'bg-[#1e2a40] border-slate-700/60' : 'bg-slate-50 border-slate-100'}"
+    <!-- 1. ФИКСИРОВАННАЯ ШАПКА -->
+    <div class="px-6 py-4 border-b flex justify-between items-start gap-4 shrink-0 relative
+      {isDark ? 'bg-[#223046] border-slate-700/70' : 'bg-slate-50/90 border-slate-200'}"
     >
-      <div class="absolute top-0 left-0 right-0 h-1 bg-gradient-to-r from-indigo-500 via-purple-500 to-rose-500"></div>
-
       <div class="min-w-0 flex-1">
-        <div class="flex items-center gap-2 mb-1">
+        <div class="flex items-center gap-2 mb-1 font-mono">
           <span class="w-2 h-2 rounded-full bg-indigo-500 animate-pulse"></span>
-          <h2 class="text-[10px] font-mono font-bold tracking-widest uppercase text-indigo-400">Архив инцидентов узла</h2>
+          <h2 class="text-[10px] font-bold tracking-widest uppercase {isDark ? 'text-indigo-400' : 'text-indigo-600'}">
+            Журнал инцидентов узла
+          </h2>
         </div>
         
-        <div class="text-xl font-bold leading-snug truncate {isDark ? 'text-slate-100' : 'text-slate-800'}" title={parsedHeader.title}>
+        <div class="text-base font-extrabold leading-snug truncate {isDark ? 'text-white' : 'text-slate-900'}" title={parsedHeader.title}>
           {parsedHeader.title}
         </div>
         
-        <div class="flex flex-wrap items-center gap-2 mt-2 font-mono text-[10px] font-bold select-none">
-          <span class="px-2.5 py-0.5 rounded-md border shadow-2xs {isDark ? 'bg-indigo-500/15 text-indigo-300 border-indigo-500/30' : 'bg-indigo-50 text-indigo-700 border-indigo-100'}">
+        <div class="flex flex-wrap items-center gap-2 mt-2 font-mono text-[10px] font-bold">
+          <span class="px-2.5 py-0.5 rounded-lg border {isDark ? 'bg-indigo-500/15 text-indigo-300 border-indigo-500/30' : 'bg-indigo-50 text-indigo-700 border-indigo-200'}">
             {parsedHeader.typeTag}
           </span>
           {#if parsedHeader.ip}
-            <span class="px-2.5 py-0.5 rounded-md border {isDark ? 'bg-[#152033] text-slate-300 border-slate-700/60' : 'bg-slate-100 text-slate-700 border-slate-200'}">
-              ID / IP: {parsedHeader.ip}
+            <span class="px-2.5 py-0.5 rounded-lg border {isDark ? 'bg-[#182335] text-slate-300 border-slate-700' : 'bg-white text-slate-700 border-slate-300'}">
+              IP: {parsedHeader.ip}
             </span>
           {/if}
           {#if parsedHeader.subtitle}
-            <span class="px-2.5 py-0.5 rounded-md border {isDark ? 'bg-[#152033] text-slate-400 border-slate-700/40' : 'bg-slate-50 text-slate-500 border-slate-100'}">
+            <span class="px-2.5 py-0.5 rounded-lg border {isDark ? 'bg-[#182335] text-slate-400 border-slate-700/60' : 'bg-white text-slate-500 border-slate-200'}">
               {parsedHeader.subtitle}
             </span>
           {/if}
         </div>
       </div>
       
-      <button on:click={close} 
-        class="w-8 h-8 shrink-0 flex items-center justify-center rounded-xl transition-all duration-200 border cursor-pointer
-        {isDark ? 'bg-[#152033] border-slate-700/80 text-slate-300 hover:text-white hover:bg-slate-700' : 'bg-slate-100 border-slate-200 text-slate-600 hover:text-slate-900'}"
+      <!-- КНОПКА ЗАКРЫТИЯ -->
+      <button 
+        on:click={close} 
+        class="px-3 py-1.5 rounded-xl border font-mono text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer shrink-0 active:scale-95
+        {isDark ? 'bg-[#182335] hover:bg-slate-700 border-slate-700 text-slate-300 hover:text-white' : 'bg-white hover:bg-slate-100 border-slate-300 text-slate-700'}"
+        title="Закрыть окно (ESC)"
       >
-        ✕
+        <span>✕</span>
+        <kbd class="opacity-60 text-[9px] font-normal">ESC</kbd>
       </button>
     </div>
 
-    <!-- Фильтры смен -->
-    <div class="px-7 py-3 border-b flex items-center justify-between font-mono text-[10px] font-bold select-none
-      {isDark ? 'bg-[#1a263c] border-slate-700/60' : 'bg-slate-50 border-slate-100'}"
+    <!-- 2. ФИКСИРОВАННАЯ ПОЛОСА ФИЛЬТРОВ СМЕН -->
+    <div class="px-6 py-2.5 border-b flex items-center justify-between font-mono text-[10px] font-bold shrink-0
+      {isDark ? 'bg-[#182335] border-slate-700/60' : 'bg-slate-100/80 border-slate-200'}"
     >
-      <span class="text-slate-400 uppercase tracking-wider text-[9px]">Фильтр смены:</span>
+      <span class="{isDark ? 'text-slate-400' : 'text-slate-600'} uppercase tracking-wider text-[9px]">Фильтр смены:</span>
+      
       <div class="flex gap-1.5">
         {#each [
           { id: 'all', label: 'Все', count: counts.all },
@@ -202,104 +235,112 @@
           { id: 'evening', label: 'Вечер', count: counts.evening },
           { id: 'night', label: 'Ночь', count: counts.night }
         ] as cat}
-          <button on:click={() => { timeFilter = cat.id; expandedEventKey = null; }}
-            class="px-2.5 py-1 rounded-lg border transition-all duration-200 cursor-pointer
+          <button 
+            on:click={() => { timeFilter = cat.id; expandedEventKey = null; }}
+            class="px-2.5 py-1 rounded-lg border transition-all cursor-pointer flex items-center gap-1
             {timeFilter === cat.id
-              ? 'bg-indigo-500 text-white border-indigo-500 shadow-2xs'
-              : (isDark ? 'bg-[#121b2d] text-slate-300 border-slate-700/60 hover:bg-slate-700/60 hover:text-slate-100' : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50')}"
+              ? (isDark ? 'bg-indigo-600 text-white border-indigo-500 shadow-sm' : 'bg-indigo-600 text-white border-indigo-600 shadow-xs')
+              : (isDark ? 'bg-[#1e2a3e] text-slate-300 border-slate-700 hover:bg-slate-700 hover:text-white' : 'bg-white text-slate-600 border-slate-300 hover:bg-slate-50')}"
           >
-            {cat.label} <span class="opacity-60">({cat.count})</span>
+            <span>{cat.label}</span>
+            <span class="opacity-70 text-[9px]">({cat.count})</span>
           </button>
         {/each}
       </div>
     </div>
 
-    <!-- Список истории -->
-    <div class="p-7 overflow-y-auto flex-1 always-visible-scroll {isDark ? 'bg-[#131b2e]/70' : 'bg-slate-50/50'}">
+    <!-- 3. ТЕЛО ТАЙМЛАЙНА СО СКРОЛЛОМ -->
+    <div class="p-6 overflow-y-auto flex-1 min-h-0 always-visible-scroll {isDark ? 'bg-[#151f30]/60' : 'bg-slate-50/50'}">
+      
       {#if isHistoryLoading}
-        <div class="flex flex-col items-center justify-center py-16">
-          <div class="w-9 h-9 border-3 border-indigo-500 border-t-transparent rounded-full animate-spin mb-3 shadow-2xs"></div>
-          <span class="text-xs font-mono font-bold tracking-widest text-indigo-400 uppercase animate-pulse">Считывание SQLite истории...</span>
+        <div class="flex flex-col items-center justify-center py-16 font-mono">
+          <div class="w-8 h-8 border-3 border-indigo-500 border-t-transparent rounded-full animate-spin mb-3"></div>
+          <span class="text-xs font-bold tracking-wider text-indigo-400 uppercase animate-pulse">Загрузка архива SQLite...</span>
         </div>
       {:else if enrichedHistory.length === 0}
-        <div class="text-center py-16 select-none">
-          <div class="text-4xl mb-3">✨</div>
-          <h3 class="text-sm font-bold {isDark ? 'text-slate-200' : 'text-slate-800'}">Сбоев не зафиксировано</h3>
-          <p class="text-xs mt-1 text-slate-400 font-mono">В базе данных нет записей о падениях за выбранный период.</p>
+        <div class="flex flex-col items-center justify-center text-center py-16">
+          <div class="w-12 h-12 rounded-2xl flex items-center justify-center mb-3 text-xl {isDark ? 'bg-emerald-500/15 text-emerald-400' : 'bg-emerald-100 text-emerald-700'}">✓</div>
+          <h3 class="text-sm font-bold {isDark ? 'text-white' : 'text-slate-900'}">Сбоев не зафиксировано</h3>
+          <p class="text-xs mt-1 text-slate-400 font-mono">За выбранный период узел работал стабильно без аварий.</p>
         </div>
       {:else}
         
-        <div class="relative pl-7 border-l-2 border-dashed {isDark ? 'border-slate-700/60' : 'border-slate-200'} ml-3 space-y-4">
+        <!-- ЛИНИЯ ТАЙМЛАЙНА -->
+        <div class="relative pl-6 border-l-2 border-dashed {isDark ? 'border-slate-700/80' : 'border-slate-300'} ml-3 space-y-3.5">
           {#each enrichedHistory as event (event.key)}
             {@const hasEnded = !event.isGroup ? !!event.end_time : !event.hasActive}
             {@const isExpanded = expandedEventKey === event.key}
             
             <div class="relative">
-              <div class="absolute -left-[37px] top-3.5 w-5 h-5 rounded-full flex items-center justify-center border transition-all duration-300
+              <!-- ТОЧКА -->
+              <div class="absolute -left-[32px] top-3.5 w-4 h-4 rounded-full flex items-center justify-center border transition-all
                 {hasEnded 
-                  ? (isDark ? 'bg-[#1e2a40] border-emerald-500 text-emerald-400' : 'bg-white border-emerald-500 text-emerald-600') 
+                  ? (isDark ? 'bg-[#1b2537] border-emerald-500 text-emerald-400' : 'bg-white border-emerald-500 text-emerald-600') 
                   : 'bg-rose-500 border-rose-300 text-white animate-pulse'}"
               >
-                <div class="w-1.5 h-1.5 rounded-full {hasEnded ? 'bg-emerald-400' : 'bg-white'}"></div>
+                <div class="w-1.5 h-1.5 rounded-full {hasEnded ? 'bg-emerald-500' : 'bg-white'}"></div>
               </div>
               
+              <!-- КАРТОЧКА СОБЫТИЯ -->
               <div 
                 on:click={() => event.isGroup && toggleExpand(event.key)}
-                class="p-4 rounded-2xl border transition-all duration-200 flex flex-col gap-2.5 backdrop-blur-md
-                {isDark ? 'bg-[#18253f] border-slate-700/60' : 'bg-white border-slate-200 shadow-2xs'}
+                class="p-3.5 rounded-2xl border transition-all flex flex-col gap-2
+                {isDark ? 'bg-[#1e2a3e] border-slate-700/80' : 'bg-white border-slate-200 shadow-2xs'}
                 {hasEnded ? 'border-l-4 border-l-emerald-500' : 'border-l-4 border-l-rose-500'}
-                {event.isGroup ? (isDark ? 'hover:border-indigo-500/50 hover:bg-slate-700/60 cursor-pointer' : 'hover:border-indigo-300 hover:bg-slate-50/60 cursor-pointer') : ''}"
+                {event.isGroup ? (isDark ? 'hover:bg-[#24334a] cursor-pointer' : 'hover:bg-slate-50 cursor-pointer') : ''}"
               >
-                <div class="flex items-center justify-between gap-4 select-none">
+                <!-- ШАПКА СОБЫТИЯ -->
+                <div class="flex items-center justify-between gap-3 font-mono text-[10px]">
                   <div class="flex items-center gap-2">
-                    <span class="text-[10px] font-mono font-bold tracking-wider uppercase
-                      {hasEnded ? 'text-emerald-400' : 'text-rose-500 animate-pulse'}"
+                    <span class="font-bold uppercase tracking-wider
+                      {hasEnded ? 'text-emerald-500' : 'text-rose-500 animate-pulse'}"
                     >
                       {#if event.isGroup}
-                        ⚠️ ФЛАППИНГ ({event.events.length} СБОЕВ ЗА ЧАС)
+                        ⚠️ ФЛАППИНГ ({event.events.length} СКАЧКОВ ЗА ЧАС)
                       {:else}
-                        {hasEnded ? 'ВОССТАНОВЛЕНО' : 'АКТИВНЫЙ СБОЙ'}
+                        {hasEnded ? 'ВОССТАНОВЛЕНО' : 'АКТИВНАЯ АВАРИЯ'}
                       {/if}
                     </span>
 
                     {#if event.isGroup}
-                      <span class="text-[10px] font-mono font-bold text-indigo-400 flex items-center gap-1 bg-indigo-500/10 px-2 py-0.5 rounded border border-indigo-500/20">
-                        <span>{isExpanded ? 'Скрыть ▲' : 'Детали ▼'}</span>
+                      <span class="text-[9.5px] font-bold text-indigo-400 bg-indigo-500/10 px-2 py-0.5 rounded border border-indigo-500/20">
+                        {isExpanded ? 'Скрыть ▲' : 'Хронология ▼'}
                       </span>
                     {/if}
                   </div>
                   
-                  <span class="text-[10px] font-mono font-bold px-2.5 py-0.5 rounded-md border
-                    {isDark ? 'bg-[#121b2d] text-indigo-300 border-slate-700' : 'bg-indigo-50 text-indigo-700 border-indigo-100'}"
-                  >
+                  <span class="font-bold px-2 py-0.5 rounded-md border tabular-nums
+                    {isDark ? 'bg-[#182335] text-slate-300 border-slate-700' : 'bg-slate-100 text-slate-800 border-slate-200'}">
                     ⏱ {formatDuration(event.duration)}
                   </span>
                 </div>
 
-                <div class="flex items-center gap-2 text-xs font-mono font-bold {isDark ? 'text-slate-100' : 'text-slate-800'}">
+                <!-- ВРЕМЕННЫЕ МЕТКИ -->
+                <div class="flex items-center gap-2 text-xs font-mono font-bold {isDark ? 'text-slate-100' : 'text-slate-900'}">
                   <span>{event.start_human}</span>
                   <span class="text-indigo-400">➔</span>
                   {#if hasEnded}
                     <span>{event.end_human}</span>
                   {:else}
-                    <span class="text-rose-500 uppercase text-[10px] font-mono font-bold tracking-wider px-2 py-0.5 rounded bg-rose-500/10 border border-rose-500/20 animate-pulse">
+                    <span class="text-rose-500 uppercase text-[10px] font-mono font-bold px-2 py-0.5 rounded bg-rose-500/10 border border-rose-500/30 animate-pulse">
                       АКТИВНО СЕЙЧАС
                     </span>
                   {/if}
                 </div>
 
+                <!-- ВЛОЖЕННАЯ ХРОНОЛОГИЯ ФЛАППИНГА -->
                 {#if event.isGroup && isExpanded}
-                  <div transition:slide={{duration: 150}} class="pt-3 mt-1 border-t border-dashed space-y-1.5 {isDark ? 'border-slate-700/60' : 'border-slate-200'}">
-                    <span class="text-[10px] font-mono font-bold uppercase tracking-wider block mb-1 text-slate-300">
-                      Хронология сбоев в этой группе:
+                  <div transition:slide={{duration: 140}} class="pt-2.5 mt-1 border-t border-dashed space-y-1.5 {isDark ? 'border-slate-700/80' : 'border-slate-200'}">
+                    <span class="text-[9.5px] font-mono font-bold uppercase tracking-wider block text-slate-400">
+                      Хронология скачков:
                     </span>
                     {#each event.events as subEvent}
                       {@const subEnded = !!subEvent.end_time}
-                      <div class="p-2.5 rounded-xl border font-mono text-xs flex items-center justify-between transition-colors
-                        {isDark ? 'bg-[#121b2d] border-slate-700/50 text-slate-100' : 'bg-slate-50 border-slate-200/80 text-slate-800 hover:border-indigo-200'}"
-                      >
+                      <div class="p-2 rounded-xl border font-mono text-xs flex items-center justify-between
+                        {isDark ? 'bg-[#182335] border-slate-700 text-slate-200' : 'bg-slate-50 border-slate-200 text-slate-900'}">
+                        
                         <div class="flex items-center gap-2">
-                          <span class="w-1.5 h-1.5 rounded-full shrink-0 {subEnded ? 'bg-emerald-500' : 'bg-rose-500 animate-pulse'}"></span>
+                          <span class="w-1.5 h-1.5 rounded-full {subEnded ? 'bg-emerald-500' : 'bg-rose-500 animate-pulse'}"></span>
                           <span>{subEvent.start_human}</span>
                           <span class="text-indigo-400">➔</span>
                           {#if subEnded}
@@ -308,7 +349,7 @@
                             <span class="text-rose-500 text-[10px] font-bold uppercase">АКТИВНО</span>
                           {/if}
                         </div>
-                        <span class="text-[10px] font-bold text-slate-300 shrink-0">
+                        <span class="text-[10px] font-bold {isDark ? 'text-slate-400' : 'text-slate-600'}">
                           ⏱ {formatDuration(subEvent.duration)}
                         </span>
                       </div>
@@ -323,5 +364,6 @@
 
       {/if}
     </div>
+
   </div>
 </div>

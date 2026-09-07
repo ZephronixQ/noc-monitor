@@ -14,8 +14,15 @@
   const dispatch = createEventDispatcher();
 
   $: pOnus = port.onus || [];
+  $: totalOnus = pOnus.length;
+
+  // Все статусы для отрисовки спектра на линии
+  $: onlineCount = pOnus.filter(o => ['working', 'host is alive'].includes((o.state||'').trim().toLowerCase())).length;
   $: strictLosCount = pOnus.filter(o => ['los', 'down'].includes((o.state||'').trim().toLowerCase())).length;
   $: losiCount = pOnus.filter(o => (o.state||'').trim().toLowerCase() === 'losi').length;
+  $: dyingCount = pOnus.filter(o => (o.state||'').trim().toLowerCase() === 'dyinggasp').length;
+  $: offlineCount = Math.max(0, totalOnus - onlineCount - strictLosCount - losiCount - dyingCount);
+
   $: isExpanded = activePort === port.name;
 
   function exportPortCsv(p) {
@@ -36,39 +43,105 @@
 <div class="rounded-2xl shrink-0 border transition-all duration-200 shadow-2xs relative
   {port.is_mass_outage 
     ? (isDark ? 'border-rose-900/80 bg-rose-950/20' : 'border-rose-300 bg-rose-50/50') 
-    : (isDark ? 'bg-[#1e2a40] border-slate-700/70' : 'bg-white border-slate-200/80')}"
+    : (isDark ? 'bg-[#1e2a3e] border-slate-700/70' : 'bg-white border-slate-200/80')}"
 >
   <div 
     class="flex items-center justify-between pr-5 cursor-pointer select-none transition-all duration-150 rounded-2xl
     {isExpanded ? 'sticky top-0 z-30 shadow-md border-b' : ''}
     {port.is_mass_outage 
       ? (isDark ? 'bg-rose-950/95 border-rose-900' : 'bg-rose-50 border-rose-200') 
-      : (isDark ? 'bg-[#1e2a40]/95 border-slate-700/80' : 'bg-white/95 border-slate-200')}"
+      : (isDark ? 'bg-[#1e2a3e]/95 border-slate-700/80' : 'bg-white/95 border-slate-200')}"
     on:click={(e) => dispatch('togglePort', { name: port.name, event: e })}
   >
     <div class="flex-1 flex items-center gap-6 p-4">
+      
+      <!-- НАЗВАНИЕ ПЛАТЫ -->
       <div class="flex items-center gap-2">
-        <span class="font-mono font-black w-14 text-base {isDark ? 'text-indigo-400' : 'text-indigo-600'}">{port.name}</span>
-        <span class="text-xs text-slate-400 transition-transform duration-200 {isExpanded ? 'rotate-180 text-indigo-500 font-bold' : ''}">▼</span>
+        <span class="font-mono font-black w-16 text-base {isDark ? 'text-indigo-400' : 'text-indigo-600'}">
+          {port.name}
+        </span>
+        <span class="text-xs text-slate-400 transition-transform duration-200 {isExpanded ? 'rotate-180 text-indigo-500 font-bold' : ''}">
+          ▼
+        </span>
       </div>
       
+      <!-- ПОЛНОЦЕННАЯ МУЛЬТИСЕГМЕНТНАЯ ШКАЛА СПЕКТРА -->
       {#if port.is_mass_outage}
-        <span class="px-2.5 py-0.5 text-[8px] font-black rounded-md bg-rose-500 text-white shadow-xs animate-pulse uppercase tracking-widest font-mono">Авария платы</span>
+        <span class="px-2.5 py-0.5 text-[8px] font-black rounded-md bg-rose-500 text-white shadow-xs animate-pulse uppercase tracking-widest font-mono">
+          Авария платы
+        </span>
       {:else}
-        <!-- ИСПРАВЛЕННЫЙ ТРЕК ПРОГРЕСС-БАРА ПЛАТЫ -->
-        <div class="w-64 h-1.5 rounded-full overflow-hidden {isDark ? 'bg-slate-700/80' : 'bg-slate-200/80'}">
-          <div class="bg-gradient-to-r from-emerald-500 to-teal-400 h-full rounded-full transition-all duration-300" style="width: {pOnus.length > 0 ? ((pOnus.length - (strictLosCount + losiCount))/pOnus.length)*100 : 0}%"></div>
+        <div class="w-64 h-[3px] rounded-full overflow-hidden flex {isDark ? 'bg-slate-700/60' : 'bg-slate-200'}">
+          {#if totalOnus === 0}
+            <div class="h-full w-full bg-slate-300 dark:bg-slate-700"></div>
+          {:else}
+            <!-- 1. ЗЕЛЕНЫЙ СЕГМЕНТ: ОНЛАЙН -->
+            {#if onlineCount > 0}
+              <div 
+                class="h-full {isDark ? 'bg-emerald-400' : 'bg-emerald-500'} transition-all duration-300" 
+                style="width: {(onlineCount / totalOnus) * 100}%" 
+                title="Онлайн: {onlineCount}">
+              </div>
+            {/if}
+
+            <!-- 2. ЖЕЛТЫЙ СЕГМЕНТ: DYING GASP (СВЕТ/ПИТАНИЕ) -->
+            {#if dyingCount > 0}
+              <div 
+                class="h-full bg-amber-400 transition-all duration-300" 
+                style="width: {(dyingCount / totalOnus) * 100}%" 
+                title="DyingGasp: {dyingCount}">
+              </div>
+            {/if}
+
+            <!-- 3. ФИОЛЕТОВЫЙ СЕГМЕНТ: LOSi (ЗАТУХАНИЕ/ИЗГИБ) -->
+            {#if losiCount > 0}
+              <div 
+                class="h-full bg-purple-500 transition-all duration-300" 
+                style="width: {(losiCount / totalOnus) * 100}%" 
+                title="LOSi: {losiCount}">
+              </div>
+            {/if}
+
+            <!-- 4. КРАСНЫЙ СЕГМЕНТ: LOS (ОБРЫВ ОПТИКИ) -->
+            {#if strictLosCount > 0}
+              <div 
+                class="h-full bg-rose-500 animate-pulse transition-all duration-300" 
+                style="width: {(strictLosCount / totalOnus) * 100}%" 
+                title="LOS: {strictLosCount}">
+              </div>
+            {/if}
+
+            <!-- 5. СЕРЫЙ СЕГМЕНТ: OFFLINE (ПЛАН) -->
+            {#if offlineCount > 0}
+              <div 
+                class="h-full bg-slate-400/80 transition-all duration-300" 
+                style="width: {(offlineCount / totalOnus) * 100}%" 
+                title="Offline: {offlineCount}">
+              </div>
+            {/if}
+          {/if}
         </div>
       {/if}
       
-      <div class="text-[11px] font-bold flex gap-2 font-mono">
-        {#if strictLosCount > 0}<span class="text-rose-500">{strictLosCount} LOS</span>{/if}
-        {#if losiCount > 0}<span class="text-fuchsia-500">{losiCount} LOSi</span>{/if}
-        {#if strictLosCount === 0 && losiCount === 0}<span class="text-emerald-500 font-extrabold">✓ 0 проблем</span>{/if}
-        <span class="text-slate-400 select-none">/ {pOnus.length} ONU</span>
+      <!-- ЧИСТЫЙ ТЕКСТОВЫЙ БЛОК: СТРОГО LOS, LOSi И СЧЁТЧИК ONU (БЕЗ DG И БЕЗ OFF) -->
+      <div class="text-[11px] font-bold flex items-center gap-2 font-mono">
+        {#if strictLosCount > 0}
+          <span class="text-rose-500 font-extrabold">{strictLosCount} LOS</span>
+        {/if}
+        
+        {#if losiCount > 0}
+          <span class="text-purple-500 font-extrabold">{losiCount} LOSi</span>
+        {/if}
+        
+        {#if strictLosCount === 0 && losiCount === 0}
+          <span class="text-emerald-500 font-extrabold">✓ 0 проблем</span>
+        {/if}
+
+        <span class="text-slate-400 select-none">/ {totalOnus} ONU</span>
       </div>
     </div>
     
+    <!-- КНОПКИ ДЕЙСТВИЙ -->
     <div class="flex items-center gap-3">
       {#if isExpanded}
         <span class="text-[9px] font-mono font-black text-indigo-400 uppercase tracking-wider hidden sm:inline">
@@ -77,7 +150,7 @@
       {/if}
 
       <button on:click|stopPropagation={() => exportPortCsv(port)} 
-        class="text-[9px] font-mono font-bold px-2.5 py-1 rounded-lg transition-all border cursor-pointer shadow-2xs
+        class="text-[9px] font-mono font-bold px-2.5 py-1 rounded-lg transition-all border cursor-pointer shadow-2xs active:scale-95
         {isDark ? 'bg-[#152033] border-slate-700 text-slate-300 hover:text-white hover:bg-slate-800' : 'bg-slate-50 border-slate-200 text-slate-600 hover:bg-slate-100'}"
       >
         CSV
@@ -85,6 +158,7 @@
     </div>
   </div>
 
+  <!-- РАСКРЫТАЯ ТАБЛИЦА АБОНЕНТОВ ПЛАТЫ -->
   {#if isExpanded}
     <GponOnuTable 
       {isDark} 

@@ -10,6 +10,8 @@ __pycache__/
 # виртуальные окружения
 venv/
 .env/
+__pycache__/
+*.pyc
 
 # ======================
 # Логи и временные файлы
@@ -32,6 +34,10 @@ backend/data/*.json
 backend/data/
 *.db
 *.sqlite
+.env
+*.env
+.env.*
+!.env.example
 
 # Настройки пользователя IDE
 .vscode/
