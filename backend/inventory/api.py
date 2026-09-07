@@ -50,11 +50,18 @@ async def get_contract_history(target_id: str, days: int = 365):
     def query_history():
         close_old_connections()
         try:
-            if ":" in clean:
+            q = Incident.objects.filter(target_id__iexact=clean)
+
+            if not q.exists() and ":" in clean:
                 parts = clean.split(":")
-                q = Incident.objects.filter(target_id__icontains=parts[-1])
-            else:
-                q = Incident.objects.filter(target_id__iexact=clean)
+                olt_ip = parts[0]
+                pure_onu = parts[-1]
+                
+                q = Incident.objects.filter(
+                    Q(target_id__iexact=clean) |
+                    Q(target_id=f"{olt_ip}:{pure_onu}") |
+                    (Q(target_id__istartswith=olt_ip) & Q(target_id__iendswith=f":{pure_onu}"))
+                )
 
             rows = list(q.filter(Q(start_time__gte=cutoff) | Q(end_time__isnull=True)).order_by('-start_time'))
             
@@ -65,6 +72,7 @@ async def get_contract_history(target_id: str, days: int = 365):
                     "start_time": inc.start_time,
                     "end_time": inc.end_time,
                     "duration": dur,
+                    "contract": inc.contract or "—",
                     "start_human": datetime.fromtimestamp(inc.start_time).strftime('%d.%m.%Y %H:%M:%S'),
                     "end_human": datetime.fromtimestamp(inc.end_time).strftime('%d.%m.%Y %H:%M:%S') if inc.end_time else "Актуально (Всё ещё DOWN)"
                 })
@@ -73,7 +81,7 @@ async def get_contract_history(target_id: str, days: int = 365):
             close_old_connections()
 
     history = await query_history()
-    print(f"📖 [DB HISTORY] Запрос узла '{clean}' за {days} дней. Из базы отдано записей: {len(history)}")
+    print(f"📖 [DB HISTORY] Запрос узла '{clean}'. Найдено записей: {len(history)}")
     return {"target_id": target_id, "days": days, "incidents": history, "total": len(history)}
 
 

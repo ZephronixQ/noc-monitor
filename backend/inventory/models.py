@@ -62,6 +62,7 @@ class Incident(models.Model):
 
     target_id = models.CharField("Идентификатор узла (IP или OLT:Port:ONU)", max_length=100, db_index=True)
     device_type = models.CharField("Тип устройства", max_length=10, choices=TYPE_CHOICES, default='sw')
+    contract = models.CharField("Договор / Описание", max_length=255, default="—", blank=True)
     start_time = models.IntegerField("Время старта (UNIX)", db_index=True)
     end_time = models.IntegerField("Время восстановления (UNIX)", null=True, blank=True, db_index=True)
     duration = models.IntegerField("Длительность (сек)", default=0)

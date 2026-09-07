@@ -10,6 +10,12 @@ from poller.olt_worker import poll_single_olt
 
 POLL_INTERVAL_SEC = 1800  # 30 минут круг OLT
 LOS_STATES = {"LOS", "DOWN", "LOSI"}
+STRICT_LOS_STATES = {"LOS", "DOWN"}
+
+MAX_DOWN_STRIKES = 7
+
+SWITCH_STRIKES_CACHE = {}
+ONU_CONTRACT_CACHE = {}
 
 INTERNAL_STATE = {
     "olt_results": [],
@@ -22,19 +28,26 @@ GLOBAL_STATE = {"data": [], "next_update": 0, "is_updating": False}
 force_update_event = asyncio.Event()
 
 
-def db_record_start(target_id: str, device_type: str, now_ts: int):
+def db_record_start(target_id: str, device_type: str, now_ts: int, contract_desc: str = "—"):
     close_old_connections()
     try:
         clean_target = target_id.strip()
         inc = Incident.objects.filter(target_id__iexact=clean_target, end_time__isnull=True).first()
-        if not inc:
-            inc = Incident.objects.create(
-                target_id=clean_target,
-                device_type=device_type,
-                start_time=now_ts,
-                duration=0
-            )
-            print(f"🚨 [DB RECORD CREATED] Авария записана в БД: {clean_target} ({device_type})")
+        
+        if inc:
+            if contract_desc and contract_desc not in ["—", "-", ""] and inc.contract in ["—", "-", ""]:
+                inc.contract = contract_desc
+                inc.save(update_fields=['contract'])
+            return inc.start_time
+
+        inc = Incident.objects.create(
+            target_id=clean_target,
+            device_type=device_type,
+            contract=contract_desc or "—",
+            start_time=now_ts,
+            duration=0
+        )
+        print(f"🚨 [DB RECORD CREATED] Авария записана в БД: {clean_target} | Договор: {inc.contract}")
         return inc.start_time
     except Exception as e:
         print(f"❌ [DB CREATE ERROR] {target_id}: {e}")
@@ -58,16 +71,13 @@ def db_record_end(target_id: str, now_ts: int):
 
 
 @sync_to_async
-def sync_switch_to_db(sw_id: str, is_down: bool, now_ts: int):
+def sync_switch_to_db(sw_id: str, is_down: bool, now_ts: int, desc: str = "—"):
     if is_down:
-        start_ts = db_record_start(sw_id, 'sw', now_ts)
+        start_ts = db_record_start(sw_id, 'sw', now_ts, contract_desc=desc)
         return True, start_ts
     else:
         db_record_end(sw_id, now_ts)
         return False, None
-
-
-STRICT_LOS_STATES = {"LOS", "DOWN"}
 
 
 @sync_to_async
@@ -83,23 +93,40 @@ def sync_gpon_to_db(olt_results: list, now_ts: int):
             is_olt_down = len(ports) == 0 or olt.get("is_offline", False)
 
             if is_olt_down:
-                db_record_start(olt_ip, 'olt', now_ts)
+                db_record_start(olt_ip, 'olt', now_ts, contract_desc=f"OLT Станция {olt_ip}")
             else:
                 db_record_end(olt_ip, now_ts)
 
             for port in ports:
+                p_name = port.get("name", "1/1")
                 for onu in port.get("onus", []):
-                    onu_id = onu.get("id", "")
+                    raw_id = str(onu.get("id", ""))
+                    pure_onu = raw_id.split(":")[-1]
                     state = str(onu.get("state", "")).strip().upper()
-                    key = f"{olt_ip}:{onu_id}"
+                    contract = onu.get("contract", "")
+
+                    full_key = f"{olt_ip}:{p_name}:{pure_onu}"
+                    short_key = f"{olt_ip}:{pure_onu}"
+
+                    if contract and contract not in ["—", "-", ""]:
+                        ONU_CONTRACT_CACHE[full_key] = contract
+                        ONU_CONTRACT_CACHE[short_key] = contract
+                    else:
+                        cached = ONU_CONTRACT_CACHE.get(full_key) or ONU_CONTRACT_CACHE.get(short_key)
+                        if cached:
+                            contract = cached
+                            onu["contract"] = cached
 
                     if state in STRICT_LOS_STATES:
-                        start_ts = db_record_start(key, 'onu', now_ts)
+                        start_ts = db_record_start(full_key, 'onu', now_ts, contract_desc=contract)
                         onu["los_time"] = start_ts
                     else:
-                        db_record_end(key, now_ts)
+                        db_record_end(full_key, now_ts)
+                        db_record_end(short_key, now_ts)
                         if state == "WORKING":
                             onu["los_time"] = None
+    except Exception as e:
+        print(f"❌ [GPON SYNC ERROR]: {e}")
     finally:
         close_old_connections()
 
@@ -186,22 +213,43 @@ async def poll_switches_loop(broadcast_callback):
                 for item in items:
                     sw_id = item["id"]
                     is_alive = item["is_alive"]
+                    desc_text = item["contract"]
 
-                    is_down = not is_alive
+                    state_data = SWITCH_STRIKES_CACHE.setdefault(sw_id, {
+                        "strikes": 0,
+                        "is_down": False,
+                        "los_start": None
+                    })
 
-                    is_down_in_db, los_start_ts = await sync_switch_to_db(sw_id, is_down, now)
+                    actual_down = state_data["is_down"]
+                    los_time = state_data["los_start"]
 
-                    if is_down_in_db:
+                    if not is_alive:
+                        state_data["strikes"] += 1
+                        if state_data["strikes"] >= MAX_DOWN_STRIKES and not actual_down:
+                            actual_down = True
+                            los_time = now
+                            state_data["is_down"] = True
+                            state_data["los_start"] = now
+                            await sync_switch_to_db(sw_id, True, now, desc=desc_text)
+                    else:
+                        state_data["strikes"] = 0
+                        if actual_down:
+                            actual_down = False
+                            los_time = None
+                            state_data["is_down"] = False
+                            state_data["los_start"] = None
+                            await sync_switch_to_db(sw_id, False, now)
+
+                    if actual_down:
                         bad_sw += 1
                         state_str = "LOS"
-                        los_time = los_start_ts
                     else:
                         state_str = "working"
-                        los_time = None
 
                     processed_onus.append({
                         "id": sw_id,
-                        "contract": item["contract"],
+                        "contract": desc_text,
                         "state": state_str,
                         "proto": item["proto"],
                         "los_time": los_time
